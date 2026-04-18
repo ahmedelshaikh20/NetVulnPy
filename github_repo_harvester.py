@@ -202,9 +202,7 @@ def save_csv(records, path):
         writer.writerows(records)
 
 
-def main():
-    args = parse_args()
-
+def run(args):
     max_repos = min(args.max_repos, MAX_API_RESULTS)
     if args.max_repos > MAX_API_RESULTS:
         print(
@@ -240,7 +238,3 @@ def main():
     print(f"Saved {len(records)} repos to:")
     print(f"  {json_path}")
     print(f"  {csv_path}")
-
-
-if __name__ == "__main__":
-    main()
