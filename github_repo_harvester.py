@@ -9,7 +9,6 @@ Usage:
                                     [--token TOKEN] [--per-page N] [--verbose]
 """
 
-import argparse
 import csv
 import json
 import os
@@ -27,6 +26,12 @@ SEARCH_URL = "https://api.github.com/search/repositories"
 MAX_API_RESULTS = 1000  # GitHub Search API hard cap
 MAX_RETRIES = 5
 
+NETWORKING_KEYWORDS = [
+    "socket", "http", "network", "ssl", "dns", "proxy","paramiko","smtp","ftp"
+]
+
+MAX_BOOLEAN_TERMS = 6  # language:python + up to 5 OR operators
+
 FIELDNAMES = [
     "name",
     "full_name",
@@ -40,43 +45,8 @@ FIELDNAMES = [
     "created_at",
     "updated_at",
     "license",
+    "size",
 ]
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Harvest open-source Python repos from GitHub."
-    )
-    parser.add_argument(
-        "--max-repos",
-        type=int,
-        default=1000,
-        help="Maximum number of repos to collect (capped at 1000 by the API).",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=".",
-        help="Directory to write repos.json and repos.csv (default: current directory).",
-    )
-    parser.add_argument(
-        "--token",
-        default=None,
-        help="GitHub personal access token. Falls back to GITHUB_TOKEN env var.",
-    )
-    parser.add_argument(
-        "--per-page",
-        type=int,
-        default=100,
-        choices=range(1, 101),
-        metavar="1-100",
-        help="Results per API page (default: 100).",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print progress messages to stderr.",
-    )
-    return parser.parse_args()
 
 
 def get_session(token):
@@ -95,9 +65,21 @@ def get_session(token):
     return session
 
 
-def search_page(session, page, per_page, verbose):
+def build_search_queries():
+    queries = []
+    for i in range(0, len(NETWORKING_KEYWORDS), MAX_BOOLEAN_TERMS):
+        chunk = NETWORKING_KEYWORDS[i : i + MAX_BOOLEAN_TERMS]
+        if len(chunk) > 1:
+            query = f"language:python ({' OR '.join(chunk)})"
+        else:
+            query = f"language:python {chunk[0]}"
+        queries.append(query)
+    return queries
+
+
+def search_page(session, query, page, per_page, verbose):
     params = {
-        "q": "language:python",
+        "q": query,
         "sort": "stars",
         "order": "desc",
         "per_page": per_page,
@@ -151,39 +133,51 @@ def extract_fields(item):
             if item.get("license")
             else None
         ),
+        "size": item.get("size"),
     }
 
 
 def fetch_all_repos(session, max_repos, per_page, verbose):
     records = []
-    page = 1
     authenticated = "Authorization" in session.headers
     page_delay = 0.5 if authenticated else 2.0
+    seen_full_names = set()
 
-    while len(records) < max_repos:
-        if verbose:
-            print(f"Fetching page {page} ...", file=sys.stderr)
+    queries = build_search_queries()
 
-        data = search_page(session, page, per_page, verbose)
-        items = data.get("items", [])
+    for query_index, query in enumerate(queries, start=1):
+        page = 1
+        while len(records) < max_repos:
+            if verbose:
+                print(
+                    f"Fetching page {page} for search group {query_index}/{len(queries)} ...",
+                    file=sys.stderr,
+                )
 
-        if not items:
-            break
+            data = search_page(session, query, page, per_page, verbose)
+            items = data.get("items", [])
 
-        for item in items:
-            records.append(extract_fields(item))
-            if len(records) >= max_repos:
+            if not items:
                 break
 
-        if verbose:
-            print(f"  Collected {len(records)} repos so far.", file=sys.stderr)
+            for item in items:
+                full_name = item.get("full_name")
+                if full_name in seen_full_names:
+                    continue
+                seen_full_names.add(full_name)
+                records.append(extract_fields(item))
+                if len(records) >= max_repos:
+                    break
 
-        if len(items) < per_page:
-            break  # last page
+            if verbose:
+                print(f"  Collected {len(records)} repos so far.", file=sys.stderr)
 
-        page += 1
-        if len(records) < max_repos:
-            time.sleep(page_delay)
+            if len(items) < per_page:
+                break  # last page for this query
+
+            page += 1
+            if len(records) < max_repos:
+                time.sleep(page_delay)
 
     return records
 
