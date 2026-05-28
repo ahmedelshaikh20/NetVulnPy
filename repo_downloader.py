@@ -10,7 +10,6 @@ Usage:
                             [--keep-files] [--verbose]
 """
 
-import argparse
 import io
 import os
 import shutil
@@ -27,44 +26,6 @@ load_dotenv()
 
 ZIPBALL_URL = "https://api.github.com/repos/{full_name}/zipball"
 MAX_RETRIES = 5
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Download GitHub repos and extract .py files for analysis."
-    )
-    parser.add_argument(
-        "--input",
-        default="repos.json",
-        help="Path to repos.json from the harvester (default: repos.json).",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=".",
-        help="Directory for downloads and results (default: current directory).",
-    )
-    parser.add_argument(
-        "--token",
-        default=None,
-        help="GitHub personal access token. Falls back to GITHUB_TOKEN env var.",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Max number of repos to process (default: all).",
-    )
-    parser.add_argument(
-        "--keep-files",
-        action="store_true",
-        help="Keep downloaded .zip and extracted files after processing.",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print progress to stderr.",
-    )
-    return parser.parse_args()
 
 
 def load_repos(input_path, limit):
@@ -247,10 +208,3 @@ def run(args):
         print(f"Failed: {failed} repos (see warnings above).")
 
 
-def main():
-    args = parse_args()
-    run(args)
-
-
-if __name__ == "__main__":
-    main()
