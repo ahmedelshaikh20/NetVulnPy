@@ -4,23 +4,16 @@ db_loader.py
 ETL script: transforms pipeline output into findings.sqlite.
 
 Sources:
-  repos.json                  → repos table
-  results/bandit_results.json → findings table
-  results/bandit_summary.csv  → scan_summary table
-
-Run:
-  python db_loader.py [--repos repos.json]
-                      [--results-dir results]
-                      [--db findings.sqlite]
+  repos.json                → repos table
+  results/scan_results.json → findings table
+  results/scan_summary.csv  → scan_summary table
 """
 
-import argparse
 import csv
 import json
 import os
-import sqlite3
 import sys
-from datetime import date, datetime, timezone
+from datetime import date, datetime
 
 DB_DEFAULT = "findings.sqlite"
 REPOS_DEFAULT = "repos.json"
@@ -45,7 +38,8 @@ CREATE TABLE repos (
     updated_at        TEXT,
     license           TEXT,
     repo_age_days     INTEGER,
-    days_since_update INTEGER
+    days_since_update INTEGER,
+    size_kb           INTEGER
 );
 
 CREATE TABLE findings (
@@ -73,8 +67,10 @@ CREATE TABLE scan_summary (
     medium           INTEGER,
     low              INTEGER,
     errors           INTEGER,
-    bandit_exit_code INTEGER,
-    status           TEXT
+    exit_code        INTEGER,
+    analyzer         TEXT,
+    status           TEXT,
+    loc              INTEGER
 );
 """
 
@@ -114,21 +110,22 @@ def load_repos(conn, repos_path):
             r.get("license"),
             _age_days(r.get("created_at")),
             _age_days(r.get("updated_at")),
+            r.get("size"),
         ))
 
     conn.executemany(
         """INSERT OR REPLACE INTO repos
            (full_name, name, html_url, description, stars, forks, open_issues,
             language, topics, created_at, updated_at, license,
-            repo_age_days, days_since_update)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            repo_age_days, days_since_update, size_kb)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         rows,
     )
     return len(rows)
 
 
 def load_findings(conn, results_dir):
-    path = os.path.join(results_dir, "bandit_results.json")
+    path = os.path.join(results_dir, "scan_results.json")
     if not os.path.exists(path):
         print(f"Warning: {path} not found — findings table will be empty.", file=sys.stderr)
         return 0
@@ -161,7 +158,7 @@ def load_findings(conn, results_dir):
 
 
 def load_scan_summary(conn, results_dir):
-    path = os.path.join(results_dir, "bandit_summary.csv")
+    path = os.path.join(results_dir, "scan_summary.csv")
     if not os.path.exists(path):
         print(f"Warning: {path} not found — scan_summary table will be empty.", file=sys.stderr)
         return 0
@@ -184,42 +181,19 @@ def load_scan_summary(conn, results_dir):
             int(row.get("medium") or 0),
             int(row.get("low") or 0),
             int(row.get("errors") or 0),
-            int(row.get("bandit_exit_code") or 0),
+            int(row.get("exit_code") or 0),
+            row.get("analyzer", "bandit"),
             row.get("status"),
+            int(row.get("loc") or 0),
         ))
 
     conn.executemany(
         """INSERT INTO scan_summary
            (full_name, py_files_found, total_issues, high, medium, low,
-            errors, bandit_exit_code, status)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
+            errors, exit_code, analyzer, status, loc)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         rows,
     )
     return len(rows)
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Build findings.sqlite from pipeline output.")
-    parser.add_argument("--repos", default=REPOS_DEFAULT)
-    parser.add_argument("--results-dir", default=RESULTS_DIR_DEFAULT)
-    parser.add_argument("--db", default=DB_DEFAULT)
-    args = parser.parse_args()
-
-    conn = sqlite3.connect(args.db)
-    conn.executescript(DDL)
-
-    n_repos    = load_repos(conn, args.repos)
-    n_findings = load_findings(conn, args.results_dir)
-    n_summary  = load_scan_summary(conn, args.results_dir)
-
-    conn.commit()
-    conn.close()
-
-    print(f"Built {args.db}:")
-    print(f"  repos:        {n_repos}")
-    print(f"  findings:     {n_findings}")
-    print(f"  scan_summary: {n_summary}")
-
-
-if __name__ == "__main__":
-    main()
