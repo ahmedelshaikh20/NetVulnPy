@@ -1,17 +1,16 @@
 """
-repo_analyzer.py  —  Phase 2: Bandit Analysis
+repo_analyzer.py  —  Phase 2: Security Analysis (Bandit or Semgrep)
 
-Scans the downloads/ directory produced by repo_downloader.py, runs Bandit
-security analysis on each repo's .py files, and aggregates findings into:
-  - bandit_results.json  : flat list of all individual findings
-  - bandit_summary.csv   : one row per repo with severity counts
+Scans the downloads/ directory produced by repo_downloader.py, runs a
+security analyzer on each repo's .py files, and aggregates findings into:
+  - scan_results.json  : flat list of all individual findings
+  - scan_summary.csv   : one row per repo with severity counts
 
-Usage:
-    python repo_analyzer.py [--downloads-dir downloads] [--output-dir .]
-                            [--limit N] [--verbose]
+Supported analyzers:
+  - bandit  (default) — Python-focused SAST
+  - semgrep           — multi-language SAST with community rules
 """
 
-import argparse
 import csv
 import json
 import os
@@ -22,42 +21,16 @@ import sys
 SUMMARY_FIELDS = [
     "full_name",
     "py_files_found",
+    "loc",
     "total_issues",
     "high",
     "medium",
     "low",
     "errors",
-    "bandit_exit_code",
+    "exit_code",
+    "analyzer",
     "status",
 ]
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Run Bandit on extracted repos and aggregate results."
-    )
-    parser.add_argument(
-        "--downloads-dir",
-        default="downloads",
-        help="Directory containing extracted repo subdirectories (default: downloads).",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default=".",
-        help="Directory to write bandit_results.json and bandit_summary.csv (default: .).",
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Max number of repos to analyze (default: all).",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Print progress to stderr.",
-    )
-    return parser.parse_args()
 
 
 def find_repo_dirs(downloads_dir, limit):
@@ -84,7 +57,7 @@ def find_repo_dirs(downloads_dir, limit):
 
 
 def load_analyzed(results_path):
-    """Return set of full_names already present in bandit_results.json."""
+    """Return set of full_names already present in scan_results.json."""
     if not os.path.exists(results_path):
         return set()
     with open(results_path, encoding="utf-8") as f:
@@ -93,6 +66,23 @@ def load_analyzed(results_path):
         except json.JSONDecodeError:
             return set()
     return {r["repo"] for r in data if "repo" in r}
+
+
+def count_loc(repo_dir):
+    """Count non-blank, non-comment Python lines across all .py files."""
+    loc = 0
+    for root, _, files in os.walk(repo_dir):
+        for f in files:
+            if f.endswith(".py"):
+                try:
+                    with open(os.path.join(root, f), encoding="utf-8", errors="ignore") as fh:
+                        loc += sum(
+                            1 for line in fh
+                            if line.strip() and not line.strip().startswith("#")
+                        )
+                except OSError:
+                    pass
+    return loc
 
 
 def count_py_files(repo_dir):
@@ -130,8 +120,8 @@ def run_bandit(repo_dir):
 def parse_bandit_output(bandit_json, full_name, repo_dir):
     """
     Transform raw Bandit JSON into:
-      - findings: list of flat finding dicts (for bandit_results.json)
-      - summary: single dict (for bandit_summary.csv)
+      - findings: list of flat finding dicts (for scan_results.json)
+      - summary: single dict (for scan_summary.csv)
     """
     results = bandit_json.get("results", [])
     errors = bandit_json.get("errors", [])
@@ -160,12 +150,103 @@ def parse_bandit_output(bandit_json, full_name, repo_dir):
     summary = {
         "full_name": full_name,
         "py_files_found": count_py_files(repo_dir),
+        "loc": count_loc(repo_dir),
         "total_issues": len(findings),
         "high": severities.count("HIGH"),
         "medium": severities.count("MEDIUM"),
         "low": severities.count("LOW"),
         "errors": len(errors),
-        "bandit_exit_code": 0 if not findings else 1,
+        "exit_code": 0 if not findings else 1,
+        "analyzer": "bandit",
+        "status": "ok",
+    }
+
+    return findings, summary
+
+
+# ── Semgrep ──────────────────────────────────────────────────────────────
+
+def run_semgrep(repo_dir):
+    """
+    Run semgrep on repo_dir with the default Python security rules.
+    Returns (parsed_json | None, stderr_text, exit_code).
+    """
+    cmd = [
+        "semgrep", "scan",
+        "--config", "p/python",
+        "--no-git-ignore",
+        "--json",
+        "--quiet",
+        repo_dir,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return None, "semgrep not found — is it installed?", -1
+
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    rc = result.returncode
+
+    if rc in (0, 1):
+        try:
+            return json.loads(stdout), stderr, rc
+        except json.JSONDecodeError:
+            return None, f"JSON parse error. stdout: {stdout[:200]}", 2
+
+    return None, stderr, rc
+
+
+_SEMGREP_SEVERITY_MAP = {
+    "ERROR": "HIGH",
+    "WARNING": "MEDIUM",
+    "INFO": "LOW",
+}
+
+
+def parse_semgrep_output(semgrep_json, full_name, repo_dir):
+    """
+    Transform raw Semgrep JSON into the same schema used for Bandit:
+      - findings: list of flat finding dicts
+      - summary: single dict
+    """
+    results = semgrep_json.get("results", [])
+    errors = semgrep_json.get("errors", [])
+
+    findings = []
+    for r in results:
+        filename = r.get("path", "")
+        if filename.startswith(repo_dir):
+            filename = filename[len(repo_dir):].lstrip(os.sep)
+
+        severity_raw = r.get("extra", {}).get("severity", "INFO").upper()
+        severity = _SEMGREP_SEVERITY_MAP.get(severity_raw, "LOW")
+
+        findings.append({
+            "repo": full_name,
+            "filename": filename,
+            "test_id": r.get("check_id", ""),
+            "test_name": r.get("check_id", "").rsplit(".", 1)[-1],
+            "issue_severity": severity,
+            "issue_confidence": r.get("extra", {}).get("metadata", {}).get("confidence", "MEDIUM").upper(),
+            "issue_text": r.get("extra", {}).get("message", ""),
+            "line_number": r.get("start", {}).get("line"),
+            "line_range": [r.get("start", {}).get("line"), r.get("end", {}).get("line")],
+            "code": r.get("extra", {}).get("lines", "").strip(),
+        })
+
+    severities = [f["issue_severity"] for f in findings]
+    summary = {
+        "full_name": full_name,
+        "py_files_found": count_py_files(repo_dir),
+        "loc": count_loc(repo_dir),
+        "total_issues": len(findings),
+        "high": severities.count("HIGH"),
+        "medium": severities.count("MEDIUM"),
+        "low": severities.count("LOW"),
+        "errors": len(errors),
+        "exit_code": 0 if not findings else 1,
+        "analyzer": "semgrep",
         "status": "ok",
     }
 
@@ -173,7 +254,7 @@ def parse_bandit_output(bandit_json, full_name, repo_dir):
 
 
 def append_results(results_path, new_findings):
-    """Atomically append findings to bandit_results.json."""
+    """Atomically append findings to scan_results.json."""
     if os.path.exists(results_path):
         with open(results_path, encoding="utf-8") as f:
             try:
@@ -192,7 +273,7 @@ def append_results(results_path, new_findings):
 
 
 def write_summary_row(summary_path, row):
-    """Append one row to bandit_summary.csv; write header if file is new."""
+    """Append one row to scan_summary.csv; write header if file is new."""
     write_header = not os.path.exists(summary_path)
     with open(summary_path, "a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS, lineterminator="\n")
@@ -202,9 +283,21 @@ def write_summary_row(summary_path, row):
 
 
 def run(args):
+    analyzer = getattr(args, "analyzer", "bandit")
+
+    if analyzer == "bandit":
+        scan_fn = run_bandit
+        parse_fn = parse_bandit_output
+    elif analyzer == "semgrep":
+        scan_fn = run_semgrep
+        parse_fn = parse_semgrep_output
+    else:
+        print(f"Error: unknown analyzer '{analyzer}'.", file=sys.stderr)
+        sys.exit(1)
+
     os.makedirs(args.output_dir, exist_ok=True)
-    results_path = os.path.join(args.output_dir, "bandit_results.json")
-    summary_path = os.path.join(args.output_dir, "bandit_summary.csv")
+    results_path = os.path.join(args.output_dir, "scan_results.json")
+    summary_path = os.path.join(args.output_dir, "scan_summary.csv")
 
     repos = find_repo_dirs(args.downloads_dir, args.limit)
     already_done = load_analyzed(results_path)
@@ -215,6 +308,7 @@ def run(args):
     failed = 0
 
     if args.verbose:
+        print(f"Using analyzer: {analyzer}", file=sys.stderr)
         print(f"Found {total} repo(s) in '{args.downloads_dir}'.", file=sys.stderr)
 
     for i, (full_name, repo_dir) in enumerate(repos, 1):
@@ -222,6 +316,8 @@ def run(args):
             if args.verbose:
                 print(f"[{i}/{total}] Skipping {full_name} (already analyzed).", file=sys.stderr)
             skipped += 1
+            if not args.keep_files:
+                shutil.rmtree(repo_dir, ignore_errors=True)
             continue
 
         py_count = count_py_files(repo_dir)
@@ -231,57 +327,55 @@ def run(args):
             write_summary_row(summary_path, {
                 "full_name": full_name,
                 "py_files_found": 0,
+                "loc": 0,
                 "total_issues": 0,
                 "high": 0, "medium": 0, "low": 0,
                 "errors": 0,
-                "bandit_exit_code": 0,
+                "exit_code": 0,
+                "analyzer": analyzer,
                 "status": "no_py_files",
             })
             skipped += 1
-            continue
-
-        if args.verbose:
-            print(f"[{i}/{total}] Analyzing {full_name} ({py_count} .py files) ...", file=sys.stderr)
-
-        bandit_json, stderr, rc = run_bandit(repo_dir)
-
-        if bandit_json is None:
+        else:
             if args.verbose:
-                print(f"    Bandit error (exit {rc}): {stderr}", file=sys.stderr)
-            write_summary_row(summary_path, {
-                "full_name": full_name,
-                "py_files_found": py_count,
-                "total_issues": 0,
-                "high": 0, "medium": 0, "low": 0,
-                "errors": 1,
-                "bandit_exit_code": rc,
-                "status": "bandit_error",
-            })
-            failed += 1
-            continue
+                print(f"[{i}/{total}] Analyzing {full_name} ({py_count} .py files) ...", file=sys.stderr)
 
-        findings, summary = parse_bandit_output(bandit_json, full_name, repo_dir)
-        append_results(results_path, findings)
-        write_summary_row(summary_path, summary)
+            scan_json, stderr, rc = scan_fn(repo_dir)
 
-        if args.verbose:
-            print(
-                f"    Found {summary['total_issues']} issue(s) — "
-                f"HIGH: {summary['high']}, MEDIUM: {summary['medium']}, LOW: {summary['low']}",
-                file=sys.stderr,
-            )
+            if scan_json is None:
+                if args.verbose:
+                    print(f"    {analyzer} error (exit {rc}): {stderr}", file=sys.stderr)
+                write_summary_row(summary_path, {
+                    "full_name": full_name,
+                    "py_files_found": py_count,
+                    "loc": count_loc(repo_dir),
+                    "total_issues": 0,
+                    "high": 0, "medium": 0, "low": 0,
+                    "errors": 1,
+                    "exit_code": rc,
+                    "analyzer": analyzer,
+                    "status": f"{analyzer}_error",
+                })
+                failed += 1
+            else:
+                findings, summary = parse_fn(scan_json, full_name, repo_dir)
+                append_results(results_path, findings)
+                write_summary_row(summary_path, summary)
 
-        analyzed += 1
+                if args.verbose:
+                    print(
+                        f"    Found {summary['total_issues']} issue(s) — "
+                        f"HIGH: {summary['high']}, MEDIUM: {summary['medium']}, LOW: {summary['low']}",
+                        file=sys.stderr,
+                    )
 
-    print(f"\nDone. Analyzed: {analyzed} | Skipped: {skipped} | Failed: {failed}")
+                analyzed += 1
+
+        if not args.keep_files:
+            shutil.rmtree(repo_dir, ignore_errors=True)
+
+    print(f"\nDone ({analyzer}). Analyzed: {analyzed} | Skipped: {skipped} | Failed: {failed}")
     print(f"Results: {results_path}")
     print(f"Summary: {summary_path}")
 
 
-def main():
-    args = parse_args()
-    run(args)
-
-
-if __name__ == "__main__":
-    main()
