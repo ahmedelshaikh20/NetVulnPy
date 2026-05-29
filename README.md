@@ -62,7 +62,7 @@ python main.py --skip-harvest --skip-download --skip-analyze --verbose
 | Argument | Default | Description |
 |---|---|---|
 | `--analyzer {bandit,semgrep}` | `bandit` | SAST tool to use |
-| `--max-repos N` | `100` | Max repos to harvest from GitHub |
+| `--max-repos N` | `2000` | Max repos to harvest from GitHub |
 | `--limit N` | all | Max repos to download/analyze |
 | `--token TOKEN` | `GITHUB_TOKEN` env | GitHub personal access token |
 | `--output-dir DIR` | `.` | Root output directory |

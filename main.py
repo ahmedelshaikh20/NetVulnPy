@@ -39,8 +39,8 @@ def parse_args():
     parser.add_argument("--verbose",    action="store_true", help="Print progress to stderr.")
 
     # Stage 1 — Harvest
-    parser.add_argument("--max-repos",  type=int, default=100,
-                        help="Max repos to harvest from GitHub (capped at 1000).")
+    parser.add_argument("--max-repos",  type=int, default=2000,
+                        help="Max repos to harvest from GitHub.")
     parser.add_argument("--skip-harvest",   action="store_true", help="Skip the harvest stage.")
 
     # Stage 2 — Download

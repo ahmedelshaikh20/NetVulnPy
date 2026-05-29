@@ -23,7 +23,7 @@ if not os.getenv("GITHUB_TOKEN"):
     load_dotenv(dotenv_path=".env.example")
 
 SEARCH_URL = "https://api.github.com/search/repositories"
-MAX_API_RESULTS = 1000  # GitHub Search API hard cap
+MAX_API_RESULTS_PER_QUERY = 1000  # GitHub Search API limit per query
 MAX_RETRIES = 5
 
 NETWORKING_KEYWORDS = [
@@ -197,12 +197,7 @@ def save_csv(records, path):
 
 
 def run(args):
-    max_repos = min(args.max_repos, MAX_API_RESULTS)
-    if args.max_repos > MAX_API_RESULTS:
-        print(
-            f"Warning: --max-repos capped at {MAX_API_RESULTS} (GitHub API limit).",
-            file=sys.stderr,
-        )
+    max_repos = args.max_repos
 
     token = args.token or os.getenv("GITHUB_TOKEN")
     if not token:
