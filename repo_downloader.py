@@ -16,6 +16,7 @@ import shutil
 import sys
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 from dotenv import load_dotenv
@@ -139,6 +140,28 @@ def cleanup(zip_path, extract_dir):
         shutil.rmtree(extract_dir, ignore_errors=True)
 
 
+def _download_one(token, full_name, downloads_dir, keep_files, verbose, page_delay):
+    """Download and extract a single repo. Returns (full_name, success, py_count)."""
+    session = get_session(token)  # thread-local session
+
+    safe_name = full_name.replace("/", "_")
+    zip_path = os.path.join(downloads_dir, f"{safe_name}.zip")
+    extract_dir = os.path.join(downloads_dir, safe_name)
+
+    ok = download_zip(session, full_name, zip_path, verbose)
+    if not ok:
+        return (full_name, False, 0)
+
+    py_count = extract_py_files(zip_path, extract_dir)
+
+    if not keep_files:
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+
+    time.sleep(page_delay)
+    return (full_name, True, py_count)
+
+
 def run(args):
     token = args.token or os.getenv("GITHUB_TOKEN")
     if not token:
@@ -148,9 +171,9 @@ def run(args):
             file=sys.stderr,
         )
 
-    session = get_session(token)
     authenticated = token is not None
     page_delay = 1.0 if authenticated else 5.0
+    workers = getattr(args, "workers", 4)
 
     repos = load_repos(args.input, args.limit)
     downloads_dir = os.path.join(args.output_dir, "downloads")
@@ -161,46 +184,35 @@ def run(args):
     failed = 0
 
     if args.verbose:
-        print(f"Processing {total} repos ...", file=sys.stderr)
+        print(f"Processing {total} repos with {workers} worker(s) ...", file=sys.stderr)
 
-    for i, repo in enumerate(repos, 1):
-        full_name = repo.get("full_name", "")
-        if not full_name:
-            if args.verbose:
-                print(f"[{i}/{total}] Skipping repo with missing full_name.", file=sys.stderr)
-            failed += 1
-            continue
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {}
+        for i, repo in enumerate(repos, 1):
+            full_name = repo.get("full_name", "")
+            if not full_name:
+                failed += 1
+                continue
+            fut = pool.submit(
+                _download_one, token, full_name, downloads_dir,
+                args.keep_files, args.verbose, page_delay,
+            )
+            futures[fut] = (i, full_name)
 
-        safe_name = full_name.replace("/", "_")
-        zip_path = os.path.join(downloads_dir, f"{safe_name}.zip")
-        extract_dir = os.path.join(downloads_dir, safe_name)
-
-        if args.verbose:
-            print(f"[{i}/{total}] {full_name}", file=sys.stderr)
-
-        # Download
-        ok = download_zip(session, full_name, zip_path, args.verbose)
-        if not ok:
-            failed += 1
-            continue
-
-        # Extract
-        py_count = extract_py_files(zip_path, extract_dir)
-
-        if args.verbose:
-            print(f"    Extracted {py_count} .py files to {extract_dir}", file=sys.stderr)
-
-        if py_count == 0:
-            print(f"    Warning: no .py files found in {full_name}", file=sys.stderr)
-
-        if not args.keep_files:
-            if os.path.exists(zip_path):
-                os.remove(zip_path)
-
-        succeeded += 1
-
-        if i < total:
-            time.sleep(page_delay)
+        for fut in as_completed(futures):
+            i, full_name = futures[fut]
+            try:
+                _, ok, py_count = fut.result()
+                if ok:
+                    succeeded += 1
+                    if args.verbose:
+                        print(f"[{succeeded + failed}/{total}] {full_name} — {py_count} .py files", file=sys.stderr)
+                else:
+                    failed += 1
+            except Exception as exc:
+                if args.verbose:
+                    print(f"[{succeeded + failed}/{total}] {full_name} — error: {exc}", file=sys.stderr)
+                failed += 1
 
     print(f"\nDone. {succeeded}/{total} repos downloaded and extracted.")
     print(f"Extracted files are in: {downloads_dir}")

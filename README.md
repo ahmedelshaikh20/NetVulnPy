@@ -66,6 +66,7 @@ python main.py --skip-harvest --skip-download --skip-analyze --verbose
 | `--limit N` | all | Max repos to download/analyze |
 | `--token TOKEN` | `GITHUB_TOKEN` env | GitHub personal access token |
 | `--output-dir DIR` | `.` | Root output directory |
+| `--workers N` | `4` | Parallel workers for download/analyze stages |
 | `--db PATH` | `findings.sqlite` | SQLite output path |
 | `--keep-files` | off | Keep downloaded files after analysis |
 | `--verbose` | off | Print progress to stderr |

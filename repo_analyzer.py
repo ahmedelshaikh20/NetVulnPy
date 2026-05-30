@@ -17,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SUMMARY_FIELDS = [
     "full_name",
@@ -177,6 +178,7 @@ def run_semgrep(repo_dir):
         "--no-git-ignore",
         "--json",
         "--quiet",
+        "--jobs", str(os.cpu_count() or 1),
         repo_dir,
     ]
     try:
@@ -282,6 +284,51 @@ def write_summary_row(summary_path, row):
         writer.writerow(row)
 
 
+def _batch_write_results(results_path, all_findings):
+    """Write all findings at once to scan_results.json."""
+    tmp_path = results_path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(all_findings, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, results_path)
+
+
+def _batch_write_summary(summary_path, all_summaries):
+    """Write all summary rows at once to scan_summary.csv."""
+    with open(summary_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(all_summaries)
+
+
+def _analyze_one(scan_fn, parse_fn, analyzer, full_name, repo_dir):
+    """Analyze a single repo. Returns (full_name, findings|None, summary, status)."""
+    py_count = count_py_files(repo_dir)
+    if py_count == 0:
+        summary = {
+            "full_name": full_name,
+            "py_files_found": 0, "loc": 0,
+            "total_issues": 0, "high": 0, "medium": 0, "low": 0,
+            "errors": 0, "exit_code": 0,
+            "analyzer": analyzer, "status": "no_py_files",
+        }
+        return (full_name, None, summary, "no_py")
+
+    scan_json, stderr, rc = scan_fn(repo_dir)
+
+    if scan_json is None:
+        summary = {
+            "full_name": full_name,
+            "py_files_found": py_count, "loc": count_loc(repo_dir),
+            "total_issues": 0, "high": 0, "medium": 0, "low": 0,
+            "errors": 1, "exit_code": rc,
+            "analyzer": analyzer, "status": f"{analyzer}_error",
+        }
+        return (full_name, None, summary, "failed")
+
+    findings, summary = parse_fn(scan_json, full_name, repo_dir)
+    return (full_name, findings, summary, "analyzed")
+
+
 def run(args):
     analyzer = getattr(args, "analyzer", "bandit")
 
@@ -301,6 +348,7 @@ def run(args):
 
     repos = find_repo_dirs(args.downloads_dir, args.limit)
     already_done = load_analyzed(results_path)
+    workers = getattr(args, "workers", 4)
 
     total = len(repos)
     analyzed = 0
@@ -308,71 +356,65 @@ def run(args):
     failed = 0
 
     if args.verbose:
-        print(f"Using analyzer: {analyzer}", file=sys.stderr)
+        print(f"Using analyzer: {analyzer} with {workers} worker(s)", file=sys.stderr)
         print(f"Found {total} repo(s) in '{args.downloads_dir}'.", file=sys.stderr)
 
-    for i, (full_name, repo_dir) in enumerate(repos, 1):
+    # Filter out already-done repos
+    work_items = []
+    for full_name, repo_dir in repos:
         if full_name in already_done:
-            if args.verbose:
-                print(f"[{i}/{total}] Skipping {full_name} (already analyzed).", file=sys.stderr)
             skipped += 1
             if not args.keep_files:
                 shutil.rmtree(repo_dir, ignore_errors=True)
-            continue
-
-        py_count = count_py_files(repo_dir)
-        if py_count == 0:
-            if args.verbose:
-                print(f"[{i}/{total}] {full_name} — no .py files, skipping.", file=sys.stderr)
-            write_summary_row(summary_path, {
-                "full_name": full_name,
-                "py_files_found": 0,
-                "loc": 0,
-                "total_issues": 0,
-                "high": 0, "medium": 0, "low": 0,
-                "errors": 0,
-                "exit_code": 0,
-                "analyzer": analyzer,
-                "status": "no_py_files",
-            })
-            skipped += 1
         else:
-            if args.verbose:
-                print(f"[{i}/{total}] Analyzing {full_name} ({py_count} .py files) ...", file=sys.stderr)
+            work_items.append((full_name, repo_dir))
 
-            scan_json, stderr, rc = scan_fn(repo_dir)
+    if args.verbose and skipped:
+        print(f"Skipped {skipped} already-analyzed repo(s).", file=sys.stderr)
 
-            if scan_json is None:
+    # Analyze in parallel, collect results in memory
+    all_findings = []
+    all_summaries = []
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_analyze_one, scan_fn, parse_fn, analyzer, fn, rd): (fn, rd)
+            for fn, rd in work_items
+        }
+
+        for fut in as_completed(futures):
+            full_name, repo_dir = futures[fut]
+            try:
+                _, findings, summary, status = fut.result()
+                all_summaries.append(summary)
+
+                if status == "analyzed":
+                    all_findings.extend(findings)
+                    analyzed += 1
+                    if args.verbose:
+                        print(
+                            f"  [{analyzed + skipped + failed}/{total}] {full_name} — "
+                            f"{summary['total_issues']} issue(s)",
+                            file=sys.stderr,
+                        )
+                elif status == "no_py":
+                    skipped += 1
+                else:
+                    failed += 1
+
+            except Exception as exc:
                 if args.verbose:
-                    print(f"    {analyzer} error (exit {rc}): {stderr}", file=sys.stderr)
-                write_summary_row(summary_path, {
-                    "full_name": full_name,
-                    "py_files_found": py_count,
-                    "loc": count_loc(repo_dir),
-                    "total_issues": 0,
-                    "high": 0, "medium": 0, "low": 0,
-                    "errors": 1,
-                    "exit_code": rc,
-                    "analyzer": analyzer,
-                    "status": f"{analyzer}_error",
-                })
+                    print(f"  {full_name} — exception: {exc}", file=sys.stderr)
                 failed += 1
-            else:
-                findings, summary = parse_fn(scan_json, full_name, repo_dir)
-                append_results(results_path, findings)
-                write_summary_row(summary_path, summary)
+            finally:
+                if not args.keep_files:
+                    shutil.rmtree(repo_dir, ignore_errors=True)
 
-                if args.verbose:
-                    print(
-                        f"    Found {summary['total_issues']} issue(s) — "
-                        f"HIGH: {summary['high']}, MEDIUM: {summary['medium']}, LOW: {summary['low']}",
-                        file=sys.stderr,
-                    )
-
-                analyzed += 1
-
-        if not args.keep_files:
-            shutil.rmtree(repo_dir, ignore_errors=True)
+    # Batch write all results at once
+    if all_findings:
+        _batch_write_results(results_path, all_findings)
+    if all_summaries:
+        _batch_write_summary(summary_path, all_summaries)
 
     print(f"\nDone ({analyzer}). Analyzed: {analyzed} | Skipped: {skipped} | Failed: {failed}")
     print(f"Results: {results_path}")
