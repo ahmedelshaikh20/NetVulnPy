@@ -30,7 +30,8 @@ NETWORKING_KEYWORDS = [
     "socket", "http", "network", "ssl", "dns", "proxy","paramiko","smtp","ftp"
 ]
 
-MAX_BOOLEAN_TERMS = 6  # language:python + up to 5 OR operators
+MAX_BOOLEAN_TERMS = 3  # fewer terms per query = more query groups to bypass 1000/query cap
+MAX_PAGES_PER_QUERY = 10  # GitHub API returns 422 beyond page 10
 
 FIELDNAMES = [
     "name",
@@ -97,6 +98,9 @@ def search_page(session, query, page, per_page, verbose):
                     )
                 time.sleep(retry_after + 1)
                 continue
+            if resp.status_code == 422:
+                # GitHub returns 422 when page exceeds available results
+                return {"items": [], "total_count": 0}
             resp.raise_for_status()
             return resp.json()
         except requests.HTTPError as exc:
@@ -172,8 +176,8 @@ def fetch_all_repos(session, max_repos, per_page, verbose):
             if verbose:
                 print(f"  Collected {len(records)} repos so far.", file=sys.stderr)
 
-            if len(items) < per_page:
-                break  # last page for this query
+            if len(items) < per_page or page >= MAX_PAGES_PER_QUERY:
+                break  # last page for this query or API page limit reached
 
             page += 1
             if len(records) < max_repos:
