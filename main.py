@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument("--token",      default=None,    help="GitHub personal access token.")
     parser.add_argument("--output-dir", default=".",     help="Root output directory.")
     parser.add_argument("--verbose",    action="store_true", help="Print progress to stderr.")
+    parser.add_argument("--workers",    type=int, default=4,
+                        help="Parallel workers for download/analyze stages.")
 
     # Stage 1 — Harvest
     parser.add_argument("--max-repos",  type=int, default=2000,
@@ -91,6 +93,7 @@ def stage_download(args):
         limit=args.limit,
         keep_files=False,  # delete ZIPs after extraction; extracted dirs kept for analyzer
         verbose=args.verbose,
+        workers=args.workers,
     )
     _run(dl_args)
 
@@ -115,6 +118,7 @@ def stage_analyze(args):
         limit=args.limit,
         keep_files=args.keep_files,
         verbose=args.verbose,
+        workers=args.workers,
     )
     _run(analyze_args)
 
