@@ -1,5 +1,5 @@
 """
-repo_analyzer.py  —  Phase 2: Security Analysis (Bandit or Semgrep)
+repo_analyzer.py  —  Phase 2: Security Analysis (Bandit, Semgrep, or Skylos)
 
 Scans the downloads/ directory produced by repo_downloader.py, runs a
 security analyzer on each repo's .py files, and aggregates findings into:
@@ -9,6 +9,7 @@ security analyzer on each repo's .py files, and aggregates findings into:
 Supported analyzers:
   - bandit  (default) — Python-focused SAST
   - semgrep           — multi-language SAST with community rules
+  - skylos            — dead code, security, secrets & quality scanner
 """
 
 import csv
@@ -255,6 +256,96 @@ def parse_semgrep_output(semgrep_json, full_name, repo_dir):
     return findings, summary
 
 
+# ── Skylos ──────────────────────────────────────────────────────────────
+
+def run_skylos(repo_dir):
+    """
+    Run skylos with --danger on repo_dir.
+    Returns (parsed_json | None, stderr_text, exit_code).
+    """
+    cmd = ["skylos", repo_dir, "--danger", "--json"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return None, "skylos not found — is it installed? (pip install skylos)", -1
+
+    stdout = result.stdout.strip()
+    stderr = result.stderr.strip()
+    rc = result.returncode
+
+    if stdout:
+        try:
+            return json.loads(stdout), stderr, rc
+        except json.JSONDecodeError:
+            return None, f"JSON parse error. stdout: {stdout[:200]}", 2
+
+    return None, stderr, rc
+
+
+_SKYLOS_SEVERITY_MAP = {
+    "HIGH": "HIGH",
+    "MEDIUM": "MEDIUM",
+    "LOW": "LOW",
+    "INFO": "LOW",
+    "CRITICAL": "HIGH",
+}
+
+
+def parse_skylos_output(skylos_json, full_name, repo_dir):
+    """
+    Transform raw Skylos JSON into the same schema used for Bandit:
+      - findings: list of flat finding dicts
+      - summary: single dict
+    """
+    results = skylos_json.get("findings", [])
+    errors = skylos_json.get("errors", []) if isinstance(skylos_json.get("errors"), list) else []
+
+    findings = []
+    for r in results:
+        file_range = r.get("range", {})
+        filename = file_range.get("file", "")
+        if filename.startswith(repo_dir):
+            filename = filename[len(repo_dir):].lstrip(os.sep)
+
+        severity_raw = r.get("severity", "LOW").upper()
+        severity = _SKYLOS_SEVERITY_MAP.get(severity_raw, "LOW")
+
+        start_line = file_range.get("start_line")
+        end_line = file_range.get("end_line")
+
+        findings.append({
+            "repo": full_name,
+            "filename": filename,
+            "test_id": r.get("rule_id", ""),
+            "test_name": r.get("category", r.get("rule_id", "")),
+            "issue_severity": severity,
+            "issue_confidence": str(r.get("confidence", "MEDIUM")).upper()
+                if isinstance(r.get("confidence"), str)
+                else f"{r.get('confidence', 'MEDIUM')}",
+            "issue_text": r.get("message", ""),
+            "line_number": start_line,
+            "line_range": [start_line, end_line],
+            "code": r.get("suggested_fix", "").strip(),
+        })
+
+    severities = [f["issue_severity"] for f in findings]
+    summary = {
+        "full_name": full_name,
+        "py_files_found": count_py_files(repo_dir),
+        "loc": count_loc(repo_dir),
+        "total_issues": len(findings),
+        "high": severities.count("HIGH"),
+        "medium": severities.count("MEDIUM"),
+        "low": severities.count("LOW"),
+        "errors": len(errors),
+        "exit_code": 0 if not findings else 1,
+        "analyzer": "skylos",
+        "status": "ok",
+    }
+
+    return findings, summary
+
+
 def append_results(results_path, new_findings):
     """Atomically append findings to scan_results.json."""
     if os.path.exists(results_path):
@@ -338,6 +429,9 @@ def run(args):
     elif analyzer == "semgrep":
         scan_fn = run_semgrep
         parse_fn = parse_semgrep_output
+    elif analyzer == "skylos":
+        scan_fn = run_skylos
+        parse_fn = parse_skylos_output
     else:
         print(f"Error: unknown analyzer '{analyzer}'.", file=sys.stderr)
         sys.exit(1)

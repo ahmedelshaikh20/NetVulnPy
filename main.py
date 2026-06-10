@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument("--skip-download",  action="store_true", help="Skip the download stage.")
 
     # Stage 3 — Analyze
-    parser.add_argument("--analyzer",  choices=["bandit", "semgrep"], default="bandit",
+    parser.add_argument("--analyzer",  choices=["bandit", "semgrep", "skylos"], default="bandit",
                         help="Security analyzer to use.")
     parser.add_argument("--skip-analyze",   action="store_true", help="Skip the analysis stage.")
 
