@@ -20,16 +20,16 @@ from data import (
 )
 from sidebar import render_sidebar
 
-severities, min_stars = render_sidebar()
+severities, min_stars, analyzer = render_sidebar()
 
 st.title("vulnscan-py — Overview")
 st.caption(
-    "Static security analysis of open-source Python repositories using Bandit. "
+    f"Static security analysis of open-source Python repositories using **{analyzer}**. "
     "This page summarises answers to the four research questions."
 )
 
 # ── KPI Strip ────────────────────────────────────────────────────────────────
-kpis = get_kpis(severities, min_stars)
+kpis = get_kpis(severities, min_stars, analyzer)
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Repos Scanned",      kpis["repos_scanned"])
@@ -46,7 +46,7 @@ col_left, col_right = st.columns(2)
 # RQ1 — Severity Distribution
 with col_left:
     st.subheader("RQ1: Severity Distribution")
-    sev_df = get_severity_counts(severities, min_stars)
+    sev_df = get_severity_counts(severities, min_stars, analyzer)
     if sev_df.empty:
         st.info("No findings with current filters.")
     else:
@@ -66,7 +66,7 @@ with col_left:
 # RQ2 — Top-10 Rules
 with col_right:
     st.subheader("RQ2: Top-10 Rules Triggered")
-    rules_df = get_top_rules(severities, min_stars, n=10)
+    rules_df = get_top_rules(severities, min_stars, n=10, analyzer=analyzer)
     if rules_df.empty:
         st.info("No findings with current filters.")
     else:
@@ -93,7 +93,7 @@ col_left2, col_right2 = st.columns(2)
 # RQ3 — Stars vs Findings
 with col_left2:
     st.subheader("RQ3: Popularity vs Findings")
-    scatter_df = get_stars_vs_findings(severities, min_stars)
+    scatter_df = get_stars_vs_findings(severities, min_stars, analyzer)
     valid = scatter_df.dropna(subset=["stars", "total_findings"])
     if len(valid) < 2:
         st.info("Scan more repositories to populate this chart.")
@@ -114,7 +114,7 @@ with col_left2:
 # RQ4 — Age vs Findings
 with col_right2:
     st.subheader("RQ4: Repository Age vs Findings")
-    age_df = get_age_vs_findings(severities, min_stars)
+    age_df = get_age_vs_findings(severities, min_stars, analyzer)
     valid2 = age_df.dropna(subset=["repo_age_days", "total_findings"])
     if len(valid2) < 2:
         st.info("Scan more repositories to populate this chart.")
@@ -137,6 +137,6 @@ st.divider()
 from datetime import date
 st.info(
     f"Dataset: top-starred Python repositories on GitHub — "
-    f"last pipeline run analysed {kpis['repos_scanned']} repo(s) with Bandit. "
+    f"last pipeline run analysed {kpis['repos_scanned']} repo(s) with **{analyzer}**. "
     f"Dashboard generated on {date.today().isoformat()}."
 )

@@ -18,14 +18,14 @@ from data import (
 )
 from sidebar import render_sidebar
 
-severities, min_stars = render_sidebar()
+severities, min_stars, analyzer = render_sidebar()
 
 st.title("Repository Explorer")
 
 # ── Leaderboard ───────────────────────────────────────────────────────────────
 st.subheader("Leaderboard")
 
-df = get_repo_leaderboard(severities, min_stars)
+df = get_repo_leaderboard(severities, min_stars, analyzer)
 
 query = st.text_input("Search repositories", "", placeholder="e.g. flask, django …")
 if query:
@@ -86,7 +86,7 @@ with col_meta:
 """)
 
 with col_donut:
-    sev_df = get_severity_counts_for_repo(repo_name, severities)
+    sev_df = get_severity_counts_for_repo(repo_name, severities, analyzer)
     if not sev_df.empty:
         fig = px.pie(
             sev_df,
@@ -105,7 +105,7 @@ with col_donut:
 
 # Findings table
 st.subheader("Findings")
-findings_df = get_repo_findings(repo_name, severities)
+findings_df = get_repo_findings(repo_name, severities, analyzer)
 
 if findings_df.empty:
     st.info("No findings found with the current filters.")

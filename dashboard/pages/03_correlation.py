@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from data import SEV_COLOR_MAP, get_age_vs_findings, get_size_vs_findings, get_stars_vs_findings
 from sidebar import render_sidebar
 
-severities, min_stars = render_sidebar()
+severities, min_stars, analyzer = render_sidebar()
 
 st.title("Correlation Analysis")
 st.caption("Exploring relationships between repository metadata and vulnerability counts.")
@@ -26,7 +26,7 @@ except ImportError:
 # ── Stars vs Findings ─────────────────────────────────────────────────────────
 st.subheader("RQ3: Repository Popularity vs Findings")
 
-stars_df = get_stars_vs_findings(severities, min_stars)
+stars_df = get_stars_vs_findings(severities, min_stars, analyzer)
 valid = stars_df.dropna(subset=["stars", "total_findings"])
 
 if len(valid) < 2:
@@ -65,7 +65,7 @@ st.divider()
 # ── Size vs Findings ──────────────────────────────────────────────────────────
 st.subheader("Repository Size (KB) vs Findings per KLOC")
 
-size_df = get_size_vs_findings(severities, min_stars)
+size_df = get_size_vs_findings(severities, min_stars, analyzer)
 valid_size = size_df.dropna(subset=["size_kb", "findings_per_kloc"])
 
 if len(valid_size) < 2:
@@ -96,7 +96,7 @@ st.divider()
 # ── Repo Age Trend ─────────────────────────────────────────────────────────────
 st.subheader("Repository Age vs Findings")
 
-age_df = get_age_vs_findings(severities, min_stars)
+age_df = get_age_vs_findings(severities, min_stars, analyzer)
 valid3 = age_df.dropna(subset=["repo_age_days", "total_findings"]).sort_values("repo_age_days")
 
 if valid3.empty:

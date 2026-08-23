@@ -1,5 +1,5 @@
 """
-repo_analyzer.py  —  Phase 2: Security Analysis (Bandit, Semgrep, or Skylos)
+repo_analyzer.py  —  Phase 2: Security Analysis (Bandit, Semgrep, Skylos, pip-audit, or LLM)
 
 Scans the downloads/ directory produced by repo_downloader.py, runs a
 security analyzer on each repo's .py files, and aggregates findings into:
@@ -7,9 +7,11 @@ security analyzer on each repo's .py files, and aggregates findings into:
   - scan_summary.csv   : one row per repo with severity counts
 
 Supported analyzers:
-  - bandit  (default) — Python-focused SAST
-  - semgrep           — multi-language SAST with community rules
-  - skylos            — dead code, security, secrets & quality scanner
+  - bandit    (default) — Python-focused SAST
+  - semgrep             — multi-language SAST with community rules
+  - pip-audit           — dependency vulnerability scanner (known CVEs)
+  - skylos              — dead code, security, secrets & quality scanner
+  - llm                 — LLM-based security analysis via OpenAI-compatible endpoint
 """
 
 import csv
@@ -256,6 +258,122 @@ def parse_semgrep_output(semgrep_json, full_name, repo_dir):
     return findings, summary
 
 
+# ── pip-audit ─────────────────────────────────────────────────────────
+
+def _find_requirements_files(repo_dir):
+    """Find all requirements*.txt files in the repo root and common subdirs."""
+    candidates = []
+    for root, _, files in os.walk(repo_dir):
+        for f in files:
+            if f.startswith("requirements") and f.endswith(".txt"):
+                candidates.append(os.path.join(root, f))
+    return candidates
+
+
+def run_pip_audit(repo_dir):
+    """
+    Run pip-audit on all requirements*.txt files in repo_dir.
+    Returns (parsed_result | None, stderr_text, exit_code).
+    """
+    req_files = _find_requirements_files(repo_dir)
+    if not req_files:
+        return None, "no requirements files found", 0
+
+    all_deps = []
+    all_stderr = []
+
+    for req_file in req_files:
+        cmd = [
+            "pip-audit", "-r", req_file,
+            "-f", "json",
+            "--no-deps",
+            "--progress-spinner", "off",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120,
+            )
+        except FileNotFoundError:
+            return None, "pip-audit not found — pip install pip-audit", -1
+        except subprocess.TimeoutExpired:
+            all_stderr.append(f"timeout: {req_file}")
+            continue
+
+        stderr = result.stderr.strip()
+        if stderr:
+            all_stderr.append(stderr)
+
+        stdout = result.stdout.strip()
+        if stdout:
+            try:
+                parsed = json.loads(stdout)
+                all_deps.extend(parsed.get("dependencies", []))
+            except json.JSONDecodeError:
+                all_stderr.append(f"JSON parse error for {req_file}")
+
+    if not all_deps:
+        return {"dependencies": []}, "\n".join(all_stderr), 0
+
+    return {"dependencies": all_deps}, "\n".join(all_stderr), 0
+
+
+def parse_pip_audit_output(audit_json, full_name, repo_dir):
+    """
+    Transform pip-audit JSON into the standard finding/summary schema.
+    Each vulnerable dependency × vulnerability becomes one finding.
+    All pip-audit findings are mapped to HIGH severity (confirmed CVEs).
+    """
+    dependencies = audit_json.get("dependencies", [])
+
+    findings = []
+    seen = set()  # deduplicate (dep_name, dep_version, vuln_id)
+    for dep in dependencies:
+        for vuln in dep.get("vulns", []):
+            vuln_id = vuln.get("id", "")
+            aliases = vuln.get("aliases", [])
+            cve = next((a for a in aliases if a.startswith("CVE-")), vuln_id)
+            dedup_key = (dep["name"], dep.get("version", "?"), cve)
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+
+            fix_versions = vuln.get("fix_versions", [])
+            desc = vuln.get("description", "")
+            # Truncate long descriptions
+            if len(desc) > 300:
+                desc = desc[:297] + "..."
+
+            findings.append({
+                "repo": full_name,
+                "filename": f"requirements (dependency: {dep['name']}=={dep.get('version', '?')})",
+                "test_id": cve,
+                "test_name": vuln_id,
+                "issue_severity": "HIGH",
+                "issue_confidence": "HIGH",
+                "issue_text": f"{dep['name']}=={dep.get('version', '?')}: {desc}",
+                "line_number": 0,
+                "line_range": [0, 0],
+                "code": f"Fix available: {', '.join(fix_versions)}" if fix_versions else "",
+            })
+
+    severities = [f["issue_severity"] for f in findings]
+    summary = {
+        "full_name": full_name,
+        "py_files_found": count_py_files(repo_dir),
+        "loc": count_loc(repo_dir),
+        "total_issues": len(findings),
+        "high": severities.count("HIGH"),
+        "medium": severities.count("MEDIUM"),
+        "low": severities.count("LOW"),
+        "errors": 0,
+        "exit_code": 0 if not findings else 1,
+        "analyzer": "pip-audit",
+        "status": "ok" if audit_json.get("dependencies") is not None else "no_requirements",
+    }
+
+    return findings, summary
+
+
 # ── Skylos ──────────────────────────────────────────────────────────────
 
 def run_skylos(repo_dir):
@@ -275,11 +393,12 @@ def run_skylos(repo_dir):
 
     if stdout:
         try:
-            return json.loads(stdout), stderr, rc
+            parsed = json.loads(stdout)
+            return parsed, stderr, rc
         except json.JSONDecodeError:
             return None, f"JSON parse error. stdout: {stdout[:200]}", 2
 
-    return None, stderr, rc
+    return None, stderr or "skylos produced no output", rc
 
 
 _SKYLOS_SEVERITY_MAP = {
@@ -296,36 +415,212 @@ def parse_skylos_output(skylos_json, full_name, repo_dir):
     Transform raw Skylos JSON into the same schema used for Bandit:
       - findings: list of flat finding dicts
       - summary: single dict
+
+    Skylos stores security findings under the "danger" key. Each entry has:
+      rule_id, severity, message, file, line, col, symbol, category
     """
-    results = skylos_json.get("findings", [])
-    errors = skylos_json.get("errors", []) if isinstance(skylos_json.get("errors"), list) else []
+    results = skylos_json.get("danger", [])
 
     findings = []
     for r in results:
-        file_range = r.get("range", {})
-        filename = file_range.get("file", "")
-        if filename.startswith(repo_dir):
+        filename = r.get("file", "")
+        abs_repo = os.path.abspath(repo_dir)
+        if filename.startswith(abs_repo):
+            filename = filename[len(abs_repo):].lstrip(os.sep)
+        elif filename.startswith(repo_dir):
             filename = filename[len(repo_dir):].lstrip(os.sep)
 
         severity_raw = r.get("severity", "LOW").upper()
         severity = _SKYLOS_SEVERITY_MAP.get(severity_raw, "LOW")
 
-        start_line = file_range.get("start_line")
-        end_line = file_range.get("end_line")
+        line = r.get("line")
 
         findings.append({
             "repo": full_name,
             "filename": filename,
             "test_id": r.get("rule_id", ""),
-            "test_name": r.get("category", r.get("rule_id", "")),
+            "test_name": r.get("symbol", r.get("rule_id", "")),
             "issue_severity": severity,
-            "issue_confidence": str(r.get("confidence", "MEDIUM")).upper()
-                if isinstance(r.get("confidence"), str)
-                else f"{r.get('confidence', 'MEDIUM')}",
+            "issue_confidence": "HIGH",
             "issue_text": r.get("message", ""),
-            "line_number": start_line,
-            "line_range": [start_line, end_line],
-            "code": r.get("suggested_fix", "").strip(),
+            "line_number": line,
+            "line_range": [line, line],
+            "code": "",
+        })
+
+    severities = [f["issue_severity"] for f in findings]
+    summary = {
+        "full_name": full_name,
+        "py_files_found": count_py_files(repo_dir),
+        "loc": count_loc(repo_dir),
+        "total_issues": len(findings),
+        "high": severities.count("HIGH"),
+        "medium": severities.count("MEDIUM"),
+        "low": severities.count("LOW"),
+        "errors": 0,
+        "exit_code": 0 if not findings else 1,
+        "analyzer": "skylos",
+        "status": "ok",
+    }
+
+    return findings, summary
+
+
+# ── LLM Analyzer ─────────────────────────────────────────────────────
+
+_LLM_ANALYSIS_PROMPT = """\
+You are a security expert analyzing Python source code for vulnerabilities.
+Analyze the following Python file and identify any security issues.
+
+**File**: {filename}
+**Repository**: {repo}
+
+```python
+{code}
+```
+
+For each vulnerability found, respond with a JSON array of objects. Each object must have:
+- "test_id": a short identifier (e.g., "LLM-SQL-INJECT", "LLM-XSS", "LLM-HARDCODED-SECRET")
+- "test_name": human-readable name of the vulnerability type
+- "issue_severity": "HIGH", "MEDIUM", or "LOW"
+- "issue_confidence": "HIGH", "MEDIUM", or "LOW"
+- "issue_text": brief description of the vulnerability
+- "line_number": the approximate line number where the issue occurs
+- "code": the relevant code snippet (1-3 lines)
+
+If no vulnerabilities are found, respond with an empty array: []
+
+Respond ONLY with the JSON array, no other text.
+"""
+
+# Module-level LLM client/config — set by run() before analysis begins
+_llm_client = None
+_llm_model = None
+
+
+def _collect_py_files(repo_dir, max_files=50, max_file_size=30_000):
+    """Collect Python files from repo_dir, with size/count limits."""
+    py_files = []
+    for root, _, files in os.walk(repo_dir):
+        for f in files:
+            if f.endswith(".py"):
+                fpath = os.path.join(root, f)
+                try:
+                    size = os.path.getsize(fpath)
+                    if size <= max_file_size:
+                        py_files.append(fpath)
+                except OSError:
+                    pass
+                if len(py_files) >= max_files:
+                    return py_files
+    return py_files
+
+
+def run_llm(repo_dir):
+    """
+    Analyze Python files in repo_dir using an LLM via OpenAI-compatible API.
+    Returns (list_of_file_results | None, stderr_text, exit_code).
+    """
+    global _llm_client, _llm_model
+    if _llm_client is None:
+        return None, "LLM client not initialized", -1
+
+    py_files = _collect_py_files(repo_dir)
+    if not py_files:
+        return None, "no Python files found", 0
+
+    all_results = []
+    errors = []
+
+    for fpath in py_files:
+        try:
+            with open(fpath, encoding="utf-8", errors="ignore") as fh:
+                code = fh.read()
+        except OSError as e:
+            errors.append(f"read error: {fpath}: {e}")
+            continue
+
+        # Skip near-empty files
+        if len(code.strip()) < 20:
+            continue
+
+        rel_path = os.path.relpath(fpath, repo_dir)
+
+        prompt = _LLM_ANALYSIS_PROMPT.format(
+            filename=rel_path,
+            repo="",  # filled in by parse_llm_output
+            code=code[:15_000],  # truncate very long files
+        )
+
+        try:
+            response = _llm_client.chat.completions.create(
+                model=_llm_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2048,
+                temperature=0.1,
+            )
+            text = response.choices[0].message.content.strip()
+
+            # Extract JSON from response (handle markdown code blocks)
+            if "```" in text:
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+                text = text.strip()
+
+            findings = json.loads(text)
+            if isinstance(findings, list):
+                for f in findings:
+                    f["_file"] = rel_path
+                all_results.extend(findings)
+
+        except json.JSONDecodeError:
+            errors.append(f"JSON parse error for {rel_path}")
+        except Exception as e:
+            errors.append(f"LLM error for {rel_path}: {e}")
+
+    return {"findings": all_results, "errors": errors}, "\n".join(errors), 0
+
+
+_LLM_SEVERITY_MAP = {
+    "HIGH": "HIGH",
+    "MEDIUM": "MEDIUM",
+    "LOW": "LOW",
+    "CRITICAL": "HIGH",
+    "INFO": "LOW",
+}
+
+
+def parse_llm_output(llm_json, full_name, repo_dir):
+    """
+    Transform LLM analysis results into the standard finding/summary schema.
+    """
+    raw_findings = llm_json.get("findings", [])
+    errors = llm_json.get("errors", [])
+
+    findings = []
+    for r in raw_findings:
+        severity = _LLM_SEVERITY_MAP.get(
+            r.get("issue_severity", "LOW").upper(), "LOW"
+        )
+        line = r.get("line_number", 0)
+        if not isinstance(line, int):
+            try:
+                line = int(line)
+            except (ValueError, TypeError):
+                line = 0
+
+        findings.append({
+            "repo": full_name,
+            "filename": r.get("_file", r.get("filename", "")),
+            "test_id": r.get("test_id", "LLM-UNKNOWN"),
+            "test_name": r.get("test_name", ""),
+            "issue_severity": severity,
+            "issue_confidence": r.get("issue_confidence", "MEDIUM").upper(),
+            "issue_text": r.get("issue_text", ""),
+            "line_number": line,
+            "line_range": [line, line],
+            "code": r.get("code", ""),
         })
 
     severities = [f["issue_severity"] for f in findings]
@@ -339,7 +634,7 @@ def parse_skylos_output(skylos_json, full_name, repo_dir):
         "low": severities.count("LOW"),
         "errors": len(errors),
         "exit_code": 0 if not findings else 1,
-        "analyzer": "skylos",
+        "analyzer": "llm",
         "status": "ok",
     }
 
@@ -429,9 +724,33 @@ def run(args):
     elif analyzer == "semgrep":
         scan_fn = run_semgrep
         parse_fn = parse_semgrep_output
+    elif analyzer == "pip-audit":
+        scan_fn = run_pip_audit
+        parse_fn = parse_pip_audit_output
     elif analyzer == "skylos":
         scan_fn = run_skylos
         parse_fn = parse_skylos_output
+    elif analyzer == "llm":
+        global _llm_client, _llm_model
+        try:
+            import openai
+        except ImportError:
+            print("Error: pip install openai", file=sys.stderr)
+            sys.exit(1)
+
+        llm_api_key = getattr(args, "llm_api_key", None) or os.environ.get("LLM_API_KEY")
+        llm_endpoint = getattr(args, "llm_endpoint", None) or "https://llms.innkube.fim.uni-passau.de"
+        llm_model = getattr(args, "llm_model", None) or "qwen3-next-80b-a3b-instruct"
+
+        if not llm_api_key:
+            print("Error: --llm-api-key or LLM_API_KEY env var required for llm analyzer.", file=sys.stderr)
+            sys.exit(1)
+
+        _llm_client = openai.OpenAI(api_key=llm_api_key, base_url=llm_endpoint)
+        _llm_model = llm_model
+
+        scan_fn = run_llm
+        parse_fn = parse_llm_output
     else:
         print(f"Error: unknown analyzer '{analyzer}'.", file=sys.stderr)
         sys.exit(1)
@@ -458,8 +777,6 @@ def run(args):
     for full_name, repo_dir in repos:
         if full_name in already_done:
             skipped += 1
-            if not args.keep_files:
-                shutil.rmtree(repo_dir, ignore_errors=True)
         else:
             work_items.append((full_name, repo_dir))
 
@@ -500,9 +817,6 @@ def run(args):
                 if args.verbose:
                     print(f"  {full_name} — exception: {exc}", file=sys.stderr)
                 failed += 1
-            finally:
-                if not args.keep_files:
-                    shutil.rmtree(repo_dir, ignore_errors=True)
 
     # Batch write all results at once
     if all_findings:

@@ -19,7 +19,7 @@ from data import (
 )
 from sidebar import render_sidebar
 
-severities, min_stars = render_sidebar()
+severities, min_stars, analyzer = render_sidebar()
 
 st.title("Vulnerability Explorer")
 
@@ -28,7 +28,7 @@ col1, col2 = st.columns(2)
 
 with col1:
     st.subheader("Findings by Severity")
-    sev_df = get_severity_counts(severities, min_stars)
+    sev_df = get_severity_counts(severities, min_stars, analyzer)
     if sev_df.empty:
         st.info("No findings with current filters.")
     else:
@@ -43,11 +43,11 @@ with col1:
         )
         fig.update_layout(showlegend=False, height=350, margin=dict(t=20))
         st.plotly_chart(fig, use_container_width=True)
-        st.caption("Total findings grouped by Bandit severity level.")
+        st.caption(f"Total findings grouped by {analyzer} severity level.")
 
 with col2:
     st.subheader("Findings per KLOC")
-    kloc_df = get_findings_per_kloc(severities, min_stars)
+    kloc_df = get_findings_per_kloc(severities, min_stars, analyzer)
     if kloc_df.empty:
         st.info("No LOC data yet — run the analyzer on downloaded repos first.")
     else:
@@ -66,7 +66,7 @@ st.divider()
 
 # ── Top-20 Rules Table ────────────────────────────────────────────────────────
 st.subheader("Top-20 Rules Triggered")
-rules_df = get_top_rules(severities, min_stars, n=20)
+rules_df = get_top_rules(severities, min_stars, n=20, analyzer=analyzer)
 if rules_df.empty:
     st.info("No rules triggered with current filters.")
 else:

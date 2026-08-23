@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from data import get_scan_log
 from sidebar import render_sidebar
 
-render_sidebar()  # render for consistency; filters not used on this page
+_, _, analyzer = render_sidebar()
 
 st.title("Methodology & Reproducibility")
 
@@ -59,7 +59,7 @@ st.info(
 
 # ── Scan Success Log ─────────────────────────────────────────────────────────
 st.header("Scan Log")
-scan_df = get_scan_log()
+scan_df = get_scan_log(analyzer)
 if scan_df.empty:
     st.warning("No scan data found. Run `python db_loader.py` first.")
 else:

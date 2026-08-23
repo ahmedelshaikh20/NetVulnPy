@@ -1,0 +1,1079 @@
+%% ACM sigconf — author draft
+\documentclass[sigconf,authordraft]{acmart}
+\usepackage{multirow}
+
+\AtBeginDocument{%
+  \providecommand\BibTeX{{Bib\TeX}}}
+
+%% Rights / conference placeholder (update before submission)
+\setcopyright{acmlicensed}
+\copyrightyear{2026}
+\acmYear{2026}
+\acmDOI{XXXXXXX.XXXXXXX}
+\acmConference[NetVulnPy '26]{Seminar on Software Security Analysis}{2026}{University}
+\acmISBN{978-1-4503-XXXX-X/2026/01}
+
+%%─────────────────────────────────────────────────────────────────────
+\begin{document}
+
+\title{Large-Scale Vulnerability Analysis of Open-Source Python Networking Repositories}
+
+\author{Ahmed Salah}
+\affiliation{%
+  \institution{University of Passau}
+  \city{Passau}
+  \country{Germany}}
+\email{ahmedelshaikh51@gmail.com}
+
+\renewcommand{\shortauthors}{Ahmed}
+
+%%─── Abstract ────────────────────────────────────────────────────────
+\begin{abstract}
+Open-source Python repositories focused on networking are widely adopted
+in production systems, yet their security posture remains understudied at
+scale. This paper presents \textsc{NetVulnPy}, an automated pipeline that
+harvests Python networking repositories from GitHub, applies static
+application security testing (SAST) using Bandit and Semgrep, and
+additionally employs LLM-based analysis for complementary vulnerability
+detection. We analyze 1{,}984 repositories using both traditional SAST
+tools and an LLM (Qwen3-Next-80B) and report on the distribution of
+vulnerabilities by severity, category, and repository characteristics
+such as popularity and size. Our results show that high-severity
+issues---most prominently insecure subprocess invocation---persist even
+in highly starred projects. The LLM analyzer produces 82{,}741 findings
+with 46.2\% at high severity, surfacing vulnerability types such as SSRF
+and path traversal that require data-flow reasoning beyond pattern
+matching. Because raw Bandit output is heavily dominated by a single
+low-severity rule (\texttt{assert\_used}, 86.9\% of all findings), we
+report both raw and noise-excluded counts and treat all detections as
+\emph{potential} rather than confirmed vulnerabilities. The three tools
+exhibit markedly different rule profiles: Bandit excels at
+Python-idiomatic security smells, Semgrep provides targeted taint-tracking
+coverage, and the LLM contributes semantic reasoning at the cost of
+taxonomic consistency. The pipeline and all data are released as
+open-source artifacts to support reproducibility.
+\end{abstract}
+
+%%─── CCS Concepts (generate yours at https://dl.acm.org/ccs/ccs.cfm) ─
+\begin{CCSXML}
+<ccs2012>
+ <concept>
+  <concept_id>10002978.10003029.10003032</concept_id>
+  <concept_desc>Security and privacy~Software security engineering</concept_desc>
+  <concept_significance>500</concept_significance>
+ </concept>
+ <concept>
+  <concept_id>10011007.10011074.10011092</concept_id>
+  <concept_desc>Software and its engineering~Software verification and validation</concept_desc>
+  <concept_significance>300</concept_significance>
+ </concept>
+</ccs2012>
+\end{CCSXML}
+\ccsdesc[500]{Security and privacy~Software security engineering}
+\ccsdesc[300]{Software and its engineering~Software verification and validation}
+
+\keywords{static analysis, vulnerability detection, Python, open source,
+  Bandit, Semgrep, LLM, SAST, software security}
+
+\maketitle
+
+%%═════════════════════════════════════════════════════════════════════
+\section{Introduction}
+\label{sec:intro}
+
+Python has become one of the most widely used programming languages,
+ranking consistently in the top three of major language indices. Its
+rich ecosystem of networking libraries---including \texttt{requests},
+\texttt{aiohttp}, \texttt{paramiko}, and \texttt{scapy}---powers
+critical infrastructure ranging from web services to network
+monitoring tools. However, the very openness that accelerates
+development also introduces security risks: developers frequently
+reuse code with insufficient scrutiny, and known vulnerability
+patterns propagate across repositories. The scale of this problem is
+substantial: Alfadel et al.~\cite{Alfadel2023} found that security
+vulnerabilities in the PyPI ecosystem take a median of 39~months to
+be discovered, and that basic networking and utility packages are
+among the highest risk factors for downstream projects---with the
+HTTP client package \texttt{urllib3} alone exposing 23.83\% of
+analyzed Python projects to known vulnerabilities. Moreover, PyPI
+currently allows developers to publish packages without any mandatory
+security checks or code vetting~\cite{Alfadel2023}, highlighting the
+need for proactive, automated vulnerability detection.
+
+Static Application Security Testing (SAST) tools offer a scalable
+means of identifying vulnerabilities without executing code. Tools
+such as Bandit and Semgrep can detect common weakness
+patterns---from SQL injection and command injection to hardcoded
+credentials and insecure cryptographic usage---by analyzing source
+code structure and data flow. Despite the availability of these
+tools, prior work has shown that many open-source projects do not
+integrate SAST into their development
+workflows~\cite{Kaur2020, Ruohonen2021}.
+
+This paper addresses the following research questions:
+
+\begin{description}
+  \item[\textbf{RQ1.}] What types and severities of vulnerabilities
+    are most prevalent in open-source Python networking repositories?
+  \item[\textbf{RQ2.}] Is there a relationship between repository
+    characteristics (stars, size, age, activity) and the density of
+    detected vulnerabilities?
+  \item[\textbf{RQ3.}] How do Bandit and Semgrep compare in terms of
+    detection coverage and complementarity on the same codebase?
+\end{description}
+
+To answer these questions, we designed and implemented
+\textsc{NetVulnPy}, a four-stage automated pipeline that:
+(1)~harvests Python networking repositories from the GitHub Search
+API, (2)~downloads and extracts their source files,
+(3)~runs Bandit and Semgrep on each repository, and
+(4)~loads all findings into a SQLite database for structured
+querying and visualization.
+
+\textbf{Contributions.} Relative to prior single-tool, PyPI-snapshot,
+or dependency-chain studies, this paper makes three new empirical
+contributions: (i)~it is, to our knowledge, the first study to focus
+SAST analysis specifically on the Python \emph{networking} domain at
+this scale; (ii)~it analyzes \emph{first-party} source code in repositories'
+active development state on GitHub rather than released PyPI snapshots or
+mined third-party vulnerability reports; and (iii)~it applies two
+complementary SAST tools (Bandit and Semgrep) to an identical corpus,
+enabling a direct comparison of their rule profiles and severity
+distributions. We also confirm, on this new corpus, two patterns previously
+reported on PyPI---the dominance of low-severity \texttt{assert} noise and
+the weak relationship between popularity and finding density.
+
+The remainder of this paper is organized as follows.
+Section~\ref{sec:background} reviews related work on vulnerability
+analysis and SAST tools. Section~\ref{sec:methodology} describes the
+\textsc{NetVulnPy} pipeline and experimental setup.
+Section~\ref{sec:results} presents our findings.
+Section~\ref{sec:discussion} discusses implications, threats to
+validity, and tool comparison. Section~\ref{sec:conclusion} concludes
+with future directions.
+
+
+%%═════════════════════════════════════════════════════════════════════
+\section{Background and Related Work}
+\label{sec:background}
+
+\subsection{Vulnerabilities in Open-Source Python Software}
+
+The prevalence of security vulnerabilities in open-source Python
+software has attracted growing research attention. Ruohonen~\cite{Ruohonen2018}
+conducted an early empirical analysis of vulnerabilities in Python
+packages for web applications, establishing that security issues are
+widespread even in popular packages. Building on this,
+Alfadel et al.~\cite{Alfadel2023} performed a large-scale empirical
+analysis of security vulnerabilities across Python packages, examining
+how vulnerabilities are introduced, persist, and eventually get fixed.
+Analyzing 2,224 open-source Python GitHub repositories and mining
+vulnerability reports from the Snyk.io database, they found that
+the majority of Python vulnerabilities are of medium severity
+(64.03\%), followed by high severity (25.42\%), with Cross-Site
+Scripting (XSS), Denial of Service (DoS), and Information Exposure
+being the most common types. Notably, their analysis focused on
+\emph{dependency-chain} vulnerabilities---security issues introduced
+through third-party packages that a project imports---rather than
+\emph{first-party} vulnerabilities present in the project's own
+source code. They also found that basic networking packages such as
+\texttt{urllib3} are among the biggest offenders, exposing 23.83\% of
+analyzed projects to vulnerabilities. The authors concluded that
+current tools are often not qualified to find complex issues and
+called for ``robust tools that combine exhaustive techniques like
+program analysis, testing, and verification.'' Our work complements
+theirs by using Bandit and Semgrep to detect first-party source-code
+vulnerabilities directly, and we compare our severity distributions
+against theirs as a baseline.
+
+Most closely related to our work, Ruohonen et al.~\cite{Ruohonen2021}
+performed a large-scale security-oriented static analysis of over
+197,000 Python packages in PyPI using Bandit, detecting more than
+749,000 security issues across 46\% of packages. They found that
+generic exception handling (\texttt{try-except-pass}) and command
+injection via the \texttt{subprocess} module were the most prevalent
+vulnerability types, with low-severity issues dominating but medium
+and high severity issues accounting for approximately 41\% of
+findings. Notably, they disabled Bandit's assertion detector (B101)
+due to excessive false positives, a design choice we consider in our
+own methodology. The authors identified three key limitations of their
+study: (1)~reliance on a single SAST tool, (2)~scanning all of PyPI
+without domain-specific filtering, and (3)~analyzing static package
+snapshots rather than active development repositories. Our work
+directly addresses all three limitations by employing both Bandit and
+Semgrep, focusing specifically on networking-domain repositories, and
+analyzing projects sourced from GitHub in their active development
+state.
+
+More recently, Quan et al.~\cite{Quan2025} presented an empirical
+study of vulnerabilities in Python packages and their detection,
+confirming that the landscape of Python security issues continues to
+evolve and that detection techniques must keep pace with emerging
+vulnerability patterns.
+
+The OWASP Top Ten~\cite{OWASP2021} provides a widely adopted
+classification of the most critical web application security risks,
+including injection, broken authentication, and security
+misconfiguration. Many of these categories are detectable through
+static analysis of Python source code.
+
+\subsection{Static Application Security Testing (SAST)}
+
+SAST tools analyze source code without execution to identify
+potential security flaws. Kaur and Nayyar~\cite{Kaur2020} conducted a
+comparative study of static code analysis tools for vulnerability
+detection in C/C++ and Java, demonstrating that different tools
+exhibit varying strengths across vulnerability categories and that no
+single tool provides complete coverage. Their findings motivate the
+multi-tool approach adopted in our work.
+
+\textbf{Bandit} is a Python-specific SAST tool maintained by the
+PyCQA community. It applies a set of predefined plugins (test IDs
+such as \texttt{B101}--\texttt{B703}) that pattern-match against known
+insecure Python constructs. Bandit groups its detectors into seven
+categories, including one specifically targeting insecure network
+protocols (TLS misconfiguration, certificate validation bypass,
+insecure SSH host keys, and clear-text protocols such as FTP and
+Telnet)~\cite{Ruohonen2021}. Each finding is annotated with both a
+severity level and a \emph{confidence} level, the latter of which can
+be used to suppress noisy detectors. Bandit is lightweight, fast, and
+produces structured JSON output, making it suitable for automated
+pipelines.
+
+\textbf{Semgrep} is a multi-language static analysis tool that uses
+pattern-matching with a syntax-aware engine. Unlike Bandit, Semgrep
+supports user-defined rules and inter-procedural taint tracking. Its
+\texttt{p/python} ruleset includes security, correctness, and
+performance checks drawn from community contributions.
+
+As Kaur and Nayyar~\cite{Kaur2020} demonstrated, no single tool
+achieves complete coverage across all vulnerability categories. We
+apply this principle by combining Bandit and Semgrep to maximize
+detection breadth.
+
+\subsection{Mining GitHub for Security Research}
+
+GitHub is the largest host of open-source code and a common data
+source for empirical software engineering research. Our methodology
+addresses known biases in repository sampling---such as the
+prevalence of inactive, toy, or forked projects---by filtering for
+Python-language repositories with networking-related keywords, sorting
+by popularity, and reporting repository characteristics alongside
+vulnerability counts. Unlike prior work that analyzed static PyPI
+snapshots~\cite{Ruohonen2021}, our GitHub-based approach captures
+projects in their active development environment, including unreleased
+code and work in progress.
+
+
+%%═════════════════════════════════════════════════════════════════════
+\section{Methodology}
+\label{sec:methodology}
+
+\subsection{Pipeline Overview}
+
+\textsc{NetVulnPy} is an end-to-end Python pipeline that
+(1)~harvests Python networking repositories from the GitHub Search
+API, (2)~downloads and extracts their Python source files,
+(3)~runs Bandit, Semgrep, and/or an LLM-based analyzer on each
+repository, and (4)~loads all findings into a SQLite database for
+structured querying and visualization via an interactive Streamlit
+dashboard.
+
+We query the GitHub Search API for repositories matching
+\texttt{language:python} combined with networking-related keywords
+(\texttt{socket}, \texttt{http}, \texttt{network}, \texttt{ssl},
+\texttt{dns}, \texttt{proxy}), sorted by star count to prioritize
+actively maintained projects. For each repository, we record metadata
+including star count, fork count, creation date, last update date,
+license, and size. Source code is downloaded as ZIP archives via the
+GitHub API, and only \texttt{.py} files are extracted.
+
+Each repository is analyzed using the selected tool. Bandit is
+invoked as \texttt{bandit -r <repo> -f json -q}; Semgrep is invoked
+as \texttt{semgrep scan --config p/python --no-git-ignore --json
+--quiet <repo>}. Both produce JSON reports containing individual
+findings with severity, affected file and line number, and a code
+snippet. Semgrep severity levels (ERROR, WARNING, INFO) are mapped to
+(HIGH, MEDIUM, LOW) for consistency with Bandit. Repositories with no
+\texttt{.py} files are skipped, and previously analyzed repositories
+are not re-analyzed, enabling incremental runs.
+
+The LLM-based analyzer sends each Python file (up to 50 files per
+repository, truncated at 15{,}000 characters) to a large language
+model via an OpenAI-compatible API. The model is prompted to return
+a structured JSON array of findings following the same schema as the
+SAST tools. We used \texttt{Qwen3-Next-80B-A3B-Instruct-FP8}
+with temperature set to 0.1 to minimize non-determinism. The LLM
+self-assigns severity, confidence, and generates descriptive rule
+identifiers for each finding.
+
+\subsection{Experimental Setup}
+
+We harvested the top 2{,}000 Python networking repositories by star
+count from GitHub (as of May 2026). After filtering repositories with
+no Python files, 1{,}984 repositories remained for analysis. Each
+repository was analyzed independently with both Bandit (v1.7+) and
+Semgrep (v1.99+). The pipeline achieved a 100\% scan success rate
+across all repositories for both tools. The pipeline was executed on
+a macOS system with Python~3.13 using 8 parallel workers.
+
+
+Lines of code (LOC) per repository, used in the vulnerability-density
+metric (Section~\ref{sec:results}), are counted as \emph{logical}
+lines: all non-blank, non-comment lines across every extracted
+\texttt{.py} file, where a comment line is defined as one whose
+stripped content begins with \texttt{\#}. This counting is performed
+by a custom function in the pipeline (no external tool used)
+
+All source code, the analysis pipeline, and the resulting database
+are available as
+\href{https://github.com/ahmedelshaikh20/NetVulnPy}{open-source artifacts}.
+%%═════════════════════════════════════════════════════════════════════
+\section{Results}
+\label{sec:results}
+
+Bandit was applied to all 1{,}984 repositories with a 100\% scan
+success rate, yielding a total of 698{,}020 findings across 72
+distinct Bandit test IDs. Of the scanned repositories, 35.2\%
+contained at least one high-severity finding. As discussed below, the
+great majority of these findings stem from a single low-severity rule;
+we therefore report both raw and noise-excluded counts throughout.
+
+\subsection{Overall Vulnerability Landscape (RQ1)}
+
+Table~\ref{tab:severity-bandit} presents the distribution of findings
+by severity level.
+
+\begin{table}[h]
+  \caption{Vulnerability counts by severity (Bandit).}
+  \label{tab:severity-bandit}
+  \begin{tabular}{lrr}
+    \toprule
+    Severity & Count & \% of Total \\
+    \midrule
+    HIGH   &   4{,}866 &  0.7\% \\
+    MEDIUM &  24{,}131 &  3.5\% \\
+    LOW    & 669{,}023 & 95.8\% \\
+    \midrule
+    Total  & 698{,}020 & 100\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Low-severity issues overwhelmingly dominate the dataset at 95.8\%,
+driven primarily by the \texttt{assert\_used} rule (B101), which alone
+accounts for 606{,}297 findings (86.9\% of all detections). Excluding
+B101, the corpus contains 91{,}723 Bandit findings, and we report this
+B101-excluded figure alongside the raw total wherever it materially
+affects interpretation. This pattern is consistent with findings from
+Ruohonen et al.~\cite{Ruohonen2021}, who also observed that
+low-severity issues dominate Bandit output, leading them to disable
+B101 due to excessive noise. Despite the low-severity dominance, the
+absolute count of high-severity findings (4{,}866) across 35.2\% of
+repositories indicates that serious potential security issues remain
+widespread in networking code.
+
+\textbf{Most common vulnerability categories.}
+Table~\ref{tab:top-rules} lists the ten most frequently triggered
+Bandit rules across all repositories.
+
+\begin{table}[h]
+  \caption{Top-10 most frequent Bandit rules.}
+  \label{tab:top-rules}
+  \begin{tabular}{rllrr}
+    \toprule
+    Rank & ID & Rule Name & Count & Sev. \\
+    \midrule
+    1  & B101 & assert\_used                        & 606{,}297 & LOW \\
+    2  & B105 & hardcoded\_password\_string          &  13{,}502 & LOW \\
+    3  & B311 & blacklist (random)                   &  12{,}429 & LOW \\
+    4  & B110 & try\_except\_pass                    &  10{,}202 & LOW \\
+    5  & B603 & subprocess\_without\_shell\_true     &   8{,}044 & LOW \\
+    6  & B607 & start\_process\_with\_partial\_path  &   4{,}794 & LOW \\
+    7  & B404 & blacklist (import subprocess)        &   4{,}095 & LOW \\
+    8  & B113 & request\_without\_timeout            &   4{,}048 & MED \\
+    9  & B106 & hardcoded\_password\_funcarg         &   3{,}978 & LOW \\
+    10 & B108 & hardcoded\_tmp\_directory            &   3{,}125 & MED \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The most prevalent finding, B101 (\texttt{assert\_used}), flags the use
+of \texttt{assert} statements which are stripped in optimized bytecode,
+potentially disabling security checks at runtime. While individually
+low-risk, the sheer volume (606{,}297 instances) indicates a
+pervasive idiom rather than a security crisis. Beyond B101,
+subprocess-related rules (B603, B607, B404) collectively account for
+16{,}933 findings. These rules flag subprocess usage that \emph{may}
+enable command injection (OWASP A03:2021~\cite{OWASP2021}); we note,
+however, that B603 (the largest of the three) specifically detects
+subprocess calls made \emph{without} \texttt{shell=True}---the
+comparatively safer invocation form---and is rated LOW severity. The
+higher-risk \texttt{shell=True} pattern is captured by a separate rule
+(B602), which does not appear among the most frequent rules in our
+corpus. These subprocess counts should therefore be read as
+\emph{exposure surface} rather than confirmed injection vectors.
+Rules B105 and B106 flag 17{,}480 \emph{candidate} hardcoded secrets;
+both are LOW-severity, pattern-based detectors that match string
+literals near password-like identifiers and are known to produce many
+false positives (test fixtures, example configuration, placeholder
+values), so without manual triage these counts indicate potential
+rather than confirmed credential exposure. The presence of
+\texttt{request\_without\_timeout} (B113) is particularly relevant to
+the networking domain, as missing timeouts can lead to denial-of-service
+conditions in client applications.
+
+
+\subsection{Repository Characteristics and Vulnerability Density (RQ2)}
+
+To investigate whether repository popularity or size correlates with
+vulnerability density, we compute the metric:
+\begin{equation}
+  \text{vuln\_density} = \frac{\text{total\_issues}}{\text{LOC}} \times 1000
+  \label{eq:density}
+\end{equation}
+expressing vulnerabilities per thousand lines of code (findings/KLOC).
+We caution that, for the Bandit-derived density, \texttt{total\_issues}
+is dominated by the low-severity B101 rule (86.9\% of all Bandit
+findings); the metric therefore partly reflects \texttt{assert} usage
+rather than security-relevant patterns.
+%% TODO: recompute Equation~\ref{eq:density} and the correlations in
+%% Table~\ref{tab:correlations} with B101 EXCLUDED, and ideally also for
+%% HIGH-severity findings only, to isolate security-relevant density.
+%% Report whether the correlation signs/magnitudes change. The current
+%% coefficients below are computed on the B101-inclusive total.
+
+The distribution of vulnerability density across repositories is
+heavily right-skewed: the majority of repositories exhibit fewer than
+50~findings per KLOC, while a long tail extends beyond
+300~findings per KLOC, indicating a small number of repositories with
+exceptionally high vulnerability density.
+
+\textbf{Popularity vs.\ Vulnerability Density.}
+We computed Pearson and Spearman correlation coefficients between
+repository star count and vulnerability density
+(Table~\ref{tab:correlations}). The Pearson correlation is
+$r = 0.208$  and the Spearman rank correlation is
+$\rho = 0.373$ . Both coefficients indicate a weak
+\emph{positive} correlation: more popular repositories tend to exhibit
+\emph{marginally higher} vulnerability density, not lower. The effect
+size is small, popularity explains only about 4\% of the variance in
+density ($r^2 \approx 0.04$)---so we interpret this as evidence that
+repository popularity is \emph{not} a reliable indicator of better code
+quality, and if anything the relationship runs weakly in the opposite
+direction.
+% TODO: VERIFY THE SIGN of this correlation against the raw data. The
+% earlier draft described a scatter plot in which the highest-density
+% repositories were small/low-star, which would imply a NEGATIVE
+% relationship and is INCONSISTENT with the positive coefficients
+% reported here. Either the coefficients or that scatter description
+% was wrong; resolve before submission and fix the prose accordingly.
+
+\textbf{Repository Size vs.\ Vulnerability Density.}
+The correlation between repository size (in KB) and vulnerability
+density is negligible: Pearson $r = -0.015$ ($p = 0.502$, not
+statistically significant), Spearman $\rho = 0.050$ ($p = 0.026$).
+Larger repositories do not exhibit systematically higher or lower
+vulnerability density. With $n = 1{,}984$, even trivially small effects
+can reach statistical significance; the Spearman result here
+($\rho = 0.050$, $p = 0.026$) is significant but practically null, and
+we do not interpret it as a meaningful relationship. This is consistent
+with the expectation that vulnerability density normalizes for project
+size.
+
+\textbf{Repository Age vs.\ Findings.}
+Analysis of repository age (in days since creation) against total
+findings reveals no clear temporal trend. Findings are distributed
+across repositories of all ages, with high-finding outliers appearing
+at every age bracket. Older repositories do not necessarily accumulate
+more findings than newer ones, suggesting that vulnerability
+introduction is not a function of project maturity.
+
+\begin{table}[h]
+  \caption{Correlation between repository metadata and vulnerability density (findings/KLOC, B101-inclusive).}
+  \label{tab:correlations}
+  \begin{tabular}{lrrrr}
+    \toprule
+    Variable & Pearson $r$ & $p$-value & Spearman $\rho$ & $p$-value \\
+    \midrule
+    Stars (popularity) & 0.208 & $<$0.001 & 0.373 & $<$0.001 \\
+    Size (KB)          & $-$0.015 & 0.502 & 0.050 & 0.026 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\newpage
+\subsection{Semgrep Results}
+
+To complement the Bandit analysis, we ran Semgrep with the
+\texttt{p/python} community ruleset on the same 1{,}984 repositories.
+Table~\ref{tab:severity-semgrep} summarizes the severity distribution.
+
+\begin{table}[h]
+  \caption{Vulnerability counts by severity (Semgrep).}
+  \label{tab:severity-semgrep}
+  \begin{tabular}{lrr}
+    \toprule
+    Severity & Count & \% of Total \\
+    \midrule
+    HIGH   & 1{,}678 & 29.9\% \\
+    MEDIUM & 3{,}427 & 61.0\% \\
+    LOW    &    509  &  9.1\% \\
+    \midrule
+    Total  & 5{,}614 & 100\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Semgrep detected 5{,}614 findings across 79 distinct rules, with
+19.7\% of repositories containing at least one high-severity finding.
+Unlike Bandit, where low-severity issues dominate due to B101
+(\texttt{assert\_used}), Semgrep's severity distribution is
+concentrated at the medium level (61.0\%), followed by high (29.9\%).
+
+Table~\ref{tab:top-rules-semgrep} lists the ten most frequently
+triggered Semgrep rules.
+
+\begin{table}[h]
+  \caption{Top-10 most frequent Semgrep rules.}
+  \label{tab:top-rules-semgrep}
+  \begin{tabular}{rlr}
+    \toprule
+    Rank & Rule & Sev. \\
+    \midrule
+    1  & subprocess-shell-true              & HIGH \\
+    2  & insecure-hash-algorithm-md5        & MED \\
+    3  & logger-credential-disclosure       & MED \\
+    4  & insecure-hash-algorithm-sha1       & MED \\
+    5  & request-with-http                  & MED \\
+    6  & insecure-file-permissions          & MED \\
+    7  & dangerous-subprocess-tainted-env   & HIGH \\
+    8  & insecure-uuid-version              & LOW \\
+    9  & bind-to-all-interfaces             & MED \\
+    10 & ssl-wrap-socket-deprecated         & MED \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\textbf{Correlation analysis.}
+Semgrep findings show even weaker correlations with repository
+metadata than Bandit: stars vs.\ vulnerability density yields
+Pearson $r = 0.134$ ($p < 0.001$), Spearman $\rho = 0.160$
+($p < 0.001$); repository size vs.\ density yields Pearson
+$r = -0.003$ ($p = 0.880$), Spearman $\rho = 0.109$ ($p < 0.001$).
+These results confirm that neither popularity nor size strongly
+predicts vulnerability density regardless of the tool used.
+
+\subsection{LLM-Based Analysis}
+
+To explore whether large language models (LLMs) can serve as a
+complementary vulnerability detection mechanism, we extended the
+\textsc{NetVulnPy} pipeline with an LLM-based analyzer. Each Python
+file in a repository is sent to an LLM with a structured prompt
+requesting security analysis; the model returns findings in a
+standardized JSON format identical to the SAST tool output schema. We
+used \texttt{Qwen3-Next-80B-A3B-Instruct} (8-bit quantized), hosted on
+a university inference endpoint compatible with the OpenAI API.
+
+The LLM analyzer successfully processed 1{,}945 of 2{,}000 repositories
+(97.3\% success rate; 55 failures due to API errors or unparseable
+responses), producing 82{,}741 findings across 14{,}693 distinct rule
+identifiers. Table~\ref{tab:severity-llm} shows the severity
+distribution.
+
+\begin{table}[h]
+  \caption{Vulnerability counts by severity (LLM).}
+  \label{tab:severity-llm}
+  \begin{tabular}{lrr}
+    \toprule
+    Severity & Count & \% of Total \\
+    \midrule
+    HIGH   & 38{,}231 & 46.2\% \\
+    MEDIUM & 37{,}044 & 44.8\% \\
+    LOW    &  7{,}466 &  9.0\% \\
+    \midrule
+    Total  & 82{,}741 & 100\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The LLM's severity distribution is strikingly different from both
+traditional SAST tools: high-severity findings constitute 46.2\% of all
+detections (vs.\ 0.7\% for Bandit and 29.9\% for Semgrep), with 95.9\%
+of repositories flagged as containing at least one high-severity issue.
+This suggests the LLM applies a more aggressive severity classification,
+potentially reflecting its training on security literature where
+vulnerability descriptions tend to emphasize worst-case impact.
+
+\textbf{Most common LLM-detected vulnerability categories.}
+Table~\ref{tab:top-rules-llm} lists the ten most frequently flagged
+categories.
+
+\begin{table}[h]
+  \caption{Top-10 most frequent LLM-detected vulnerability categories.}
+  \label{tab:top-rules-llm}
+  \begin{tabular}{rlrr}
+    \toprule
+    Rank & Category & Count & Sev. \\
+    \midrule
+    1  & Hardcoded Secrets            & 8{,}477 & HIGH \\
+    2  & Unsanitized Network Input    & 3{,}738 & MED  \\
+    3  & Path Traversal               & 2{,}793 & HIGH \\
+    4  & Injection (JSON/Input)       & 2{,}544 & HIGH \\
+    5  & Hardcoded File Paths         & 1{,}834 & HIGH \\
+    6  & Command Injection (Env Vars) & 1{,}756 & HIGH \\
+    7  & SQL Injection                & 1{,}559 & HIGH \\
+    8  & Command Injection (Shell)    & 1{,}486 & HIGH \\
+    9  & SSRF                         & 1{,}201 & HIGH \\
+    10 & Code Injection               & 1{,}151 & HIGH \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The LLM's top findings are dominated by high-severity categories. The
+most frequent category, hardcoded secrets (8{,}477 findings), overlaps
+conceptually with Bandit's B105/B106 rules (17{,}480 combined findings),
+but the LLM flags fewer instances, potentially because it can use
+semantic context to distinguish real credentials from test fixtures and
+placeholder values---a distinction that pattern-based rules cannot make.
+Command injection categories (ranks 6, 8, 10) collectively account for
+4{,}378 findings, compared to 16{,}933 subprocess-related Bandit
+findings; the lower count may reflect the LLM's ability to assess
+whether user-controlled input actually reaches the subprocess call. The
+LLM also surfaces vulnerability types not covered by the default Bandit
+or Semgrep rulesets, notably SSRF (1{,}201 findings) and path traversal
+(2{,}793 findings), which require data-flow reasoning beyond simple
+pattern matching.
+
+\textbf{Correlation analysis.}
+The LLM findings exhibit a weak \emph{negative} correlation between
+repository popularity and vulnerability density: Pearson $r = -0.139$
+($p < 0.001$), Spearman $\rho = -0.385$ ($p < 0.001$). This is the
+opposite sign from the Bandit and Semgrep correlations (both weakly
+positive), suggesting that the LLM may be more sensitive to code quality
+patterns that improve with community scrutiny. Repository size vs.\
+density remains negligible: Pearson $r = -0.015$ ($p = 0.516$), Spearman
+$\rho = -0.435$ ($p < 0.001$).
+
+\textbf{Limitations of LLM-based analysis.}
+While the LLM generates a rich and diverse set of findings, several
+caveats apply: (1)~the 14{,}693 distinct ``rule'' identifiers are
+LLM-generated labels, not standardized taxonomies, making cross-tool
+comparison imprecise; (2)~LLMs are known to hallucinate, so some
+findings may describe vulnerabilities that do not exist in the code;
+(3)~the analysis is limited by context window size (files are truncated
+at 15{,}000 characters) and per-file granularity, preventing
+cross-file taint analysis; (4)~reproducibility is limited by model
+non-determinism (temperature was set to 0.1 to minimize variance). We
+therefore treat LLM findings as a \emph{complementary signal} requiring
+validation rather than a replacement for established SAST tools.
+
+\subsection{Tool Comparison: Bandit vs.\ Semgrep vs.\ LLM (RQ3)}
+
+Table~\ref{tab:tool-comparison} contrasts the three tools on the same
+corpus.
+
+\begin{table}[h]
+  \caption{Detection comparison: Bandit vs.\ Semgrep vs.\ LLM.}
+  \label{tab:tool-comparison}
+  \begin{tabular}{lrrr}
+    \toprule
+    Metric & Bandit & Semgrep & LLM \\
+    \midrule
+    Total findings            & 698{,}020 & 5{,}614 & 82{,}741 \\
+    Total (excl.\ B101)       & 91{,}723  & 5{,}614 & 82{,}741 \\
+    Distinct rules            & 72        & 79      & 14{,}693 \\
+    Repos with $\geq$1 HIGH   & 35.2\%   & 19.7\%  & 95.9\% \\
+    HIGH findings             & 4{,}866   & 1{,}678  & 38{,}231 \\
+    MEDIUM findings           & 24{,}131  & 3{,}427  & 37{,}044 \\
+    LOW findings              & 669{,}023 & 509      & 7{,}466 \\
+    Scan success rate         & 100\%     & 100\%    & 97.3\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Bandit produces the highest raw finding count, primarily because
+Bandit's B101 (\texttt{assert\_used}) rule alone generates 606{,}297
+low-severity findings. Excluding B101, Bandit produces 91{,}723
+findings, comparable in scale to the LLM's 82{,}741 findings.
+Semgrep's community rules are more targeted, producing 5{,}614
+findings---an order of magnitude fewer. The LLM occupies a middle
+ground in volume but diverges sharply in severity distribution: 46.2\%
+of its findings are high-severity, compared to 0.7\% for Bandit and
+29.9\% for Semgrep.
+
+The three tools exhibit distinct detection profiles. Bandit excels at
+flagging Python-idiomatic security smells (assert usage, subprocess
+patterns, hardcoded credentials via pattern matching) but produces
+substantial noise. Semgrep provides more targeted detections with
+taint-tracking capabilities and a higher proportion of actionable
+findings. The LLM contributes a qualitatively different perspective:
+it can reason about semantic context (e.g., distinguishing test
+fixtures from real credentials), surfaces vulnerability types
+requiring data-flow reasoning (SSRF, path traversal), and generates
+vulnerability descriptions in natural language. However, the LLM's
+14{,}693 distinct ``rule'' identifiers---compared to Bandit's 72 and
+Semgrep's 79---reflect a lack of taxonomic consistency, and its 95.9\%
+high-severity repository rate suggests over-classification.
+
+We caution that cross-tool severity comparisons are limited by
+differing severity semantics: Bandit uses its own calibrated severity
+scale, Semgrep's ERROR/WARNING/INFO levels are mapped to
+HIGH/MEDIUM/LOW, and the LLM self-assigns severity based on its
+training data. The LLM's substantially higher high-severity rate
+likely reflects both genuine detection of issues missed by pattern
+matching and over-reporting driven by the model's tendency to
+emphasize worst-case impact.
+
+\subsection{Precision Validation}
+
+To estimate the true-positive rate of each tool, we performed an
+LLM-assisted validation of a stratified random sample of 100~findings
+per analyzer. For each sampled finding, we retrieved the full source
+file from the downloaded repository and submitted both the tool's
+report and the complete source code to an independent LLM
+(\texttt{Qwen3-Next-80B-A3B-Instruct}) for verification. The verifier
+was prompted to classify each finding as \textsc{true\_positive} (a
+genuine, exploitable vulnerability in production context) or
+\textsc{false\_positive} (a false alarm---safe usage, test code, or
+non-exploitable pattern), along with a confidence level and reasoning.
+Each 100-finding sample was stratified across severity levels (34~HIGH,
+33~MEDIUM, 33~LOW) to ensure representation at every severity tier.
+Pip-audit findings were excluded from this validation because they
+flag dependency-level CVEs rather than first-party source code, and
+the corresponding source files are not present in the downloaded
+repositories.
+
+Table~\ref{tab:precision} summarizes the results.
+
+\begin{table}[h]
+  \caption{Precision validation: 100 stratified samples per analyzer.}
+  \label{tab:precision}
+  \begin{tabular}{lrrr}
+    \toprule
+    Analyzer & Evaluated & True Pos. & Precision \\
+    \midrule
+    Semgrep  & 100 & 21 & 21.0\% \\
+    Bandit   & 100 & 10 & 10.0\% \\
+    LLM      & 100 &  9 &  9.0\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Semgrep achieves the highest overall precision at 21.0\%, followed by
+Bandit (10.0\%) and the LLM (9.0\%). The differences are more
+pronounced at the HIGH severity level
+(Table~\ref{tab:precision-severity}): Semgrep confirms 47.1\% of its
+HIGH findings as true positives, compared to 29.4\% for Bandit and
+20.6\% for the LLM. At MEDIUM severity, precision drops sharply for
+all tools (Semgrep: 15.2\%, LLM: 6.1\%, Bandit: 0.0\%). No tool
+achieved any true positives among LOW-severity findings in the sample,
+confirming that low-severity detections are overwhelmingly noise.
+
+\begin{table}[h]
+  \caption{Precision by reported severity level (100 samples per tool).}
+  \label{tab:precision-severity}
+  \begin{tabular}{llrr}
+    \toprule
+    Severity & Analyzer & TP / Evaluated & Precision \\
+    \midrule
+    \multirow{3}{*}{HIGH}
+      & Semgrep & 16 / 34 & 47.1\% \\
+      & Bandit  & 10 / 34 & 29.4\% \\
+      & LLM     &  7 / 34 & 20.6\% \\
+    \midrule
+    \multirow{3}{*}{MEDIUM}
+      & Semgrep &  5 / 33 & 15.2\% \\
+      & LLM     &  2 / 33 &  6.1\% \\
+      & Bandit  &  0 / 33 &  0.0\% \\
+    \midrule
+    \multirow{3}{*}{LOW}
+      & Semgrep &  0 / 33 &  0.0\% \\
+      & Bandit  &  0 / 33 &  0.0\% \\
+      & LLM     &  0 / 33 &  0.0\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+These results have several implications. First, all three tools
+exhibit high false-positive rates (79--91\%), confirming that raw SAST
+output requires triage before it can inform remediation decisions.
+Second, Semgrep's higher precision---particularly at HIGH
+severity---validates its design philosophy of fewer, more targeted
+rules over broad pattern matching. Third, the LLM's precision (9.0\%)
+is comparable to Bandit's (10.0\%) despite producing qualitatively
+different findings; the LLM's confirmed true positives include
+categories absent from Bandit's ruleset (SQL injection, path
+traversal, SSRF), demonstrating complementary value even at modest
+precision. Fourth, the uniformly zero precision at LOW severity across
+all tools strongly supports filtering or suppressing low-severity
+findings in practice.
+
+We note that this validation itself uses an LLM as the verifier, which
+introduces potential bias: the verifier may share systematic blind
+spots with the LLM analyzer. We discuss this limitation further in
+Section~\ref{sec:discussion}.
+
+
+%%═════════════════════════════════════════════════════════════════════
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{Key Findings}
+
+Our analysis of 1{,}984 Python networking repositories reveals several
+important observations:
+
+\begin{enumerate}
+  \item \textbf{High-severity issues are widespread but mostly
+    unconfirmed.} Over one in three repositories (35.2\%) contains at
+    least one high-severity Bandit finding, with 4{,}866 high-severity
+    detections in total. However, our precision validation
+    (Section~\ref{sec:results}) reveals that only 29.4\% of Bandit's
+    HIGH findings and 47.1\% of Semgrep's HIGH findings are confirmed
+    true positives. Subprocess-related rules (B603, B607, B404)
+    collectively flag 16{,}933 subprocess call sites (potential
+    injection surface; OWASP A03:2021~\cite{OWASP2021}), though the
+    most frequent of these (B603) detects the lower-risk
+    non-\texttt{shell} invocation form. These counts therefore
+    represent exposure surface rather than confirmed vulnerabilities.
+
+  \item \textbf{Low-severity noise dominates raw counts.} The
+    \texttt{assert\_used} rule (B101) alone produces 606{,}297
+    findings---86.9\% of all detections. This confirms the observation
+    by Ruohonen et al.~\cite{Ruohonen2021} that B101 generates
+    excessive noise. Bandit additionally records a \emph{confidence}
+    level for every finding (stored in our schema but not yet used for
+    filtering); confidence-based filtering offers a principled,
+    zero-cost way to suppress B101-class noise and should be applied in
+    future analyses.
+
+  \item \textbf{Candidate hardcoded credentials are common.} Rules
+    B105 and B106 together flag 17{,}480 candidate hardcoded secrets.
+    Because these pattern-based, low-severity rules are prone to false
+    positives, this figure should be read as an upper bound on
+    potential credential exposure rather than confirmed poor practice;
+    manual triage (see Threats to Validity) is needed to estimate the
+    true rate.
+
+  \item \textbf{The three tools have distinct detection profiles.}
+    Bandit produces 698{,}020 findings (91{,}723 excluding B101 noise),
+    Semgrep produces 5{,}614 more targeted findings with 29.9\%
+    at high severity, and the LLM produces 82{,}741 findings with
+    46.2\% at high severity. The three tools surface largely different
+    top rules and vulnerability categories, suggesting that no single
+    tool provides complete coverage and supporting the multi-tool
+    approach advocated by Kaur and Nayyar~\cite{Kaur2020}. The LLM
+    additionally surfaces vulnerability types (SSRF, path traversal)
+    that require data-flow reasoning beyond pattern matching.
+
+  \item \textbf{LLM analysis offers complementary but noisy coverage.}
+    The LLM generates 14{,}693 distinct rule identifiers (vs.\ 72 for
+    Bandit and 79 for Semgrep), reflecting rich but taxonomically
+    inconsistent output. Its high-severity rate (95.9\% of repos flagged)
+    suggests over-classification, yet the semantic reasoning capability
+    allows it to surface categories absent from traditional SAST tools.
+    LLM-based analysis is best positioned as a triage aid or
+    complementary signal rather than a standalone scanner.
+
+  \item \textbf{Popularity does not predict better security.}
+    Bandit and Semgrep show weak \emph{positive} correlations between
+    star count and vulnerability density (Bandit: $r = 0.208$; Semgrep:
+    $r = 0.134$), while the LLM shows a weak \emph{negative} correlation
+    ($r = -0.139$). The inconsistent direction across tools suggests the
+    relationship is fragile and tool-dependent. In all cases, popularity
+    is not a reliable proxy for security quality.
+
+  \item \textbf{Vulnerability density is independent of repository
+    size and age.} Neither larger nor older repositories exhibit
+    systematically different vulnerability densities, suggesting that
+    security issues are introduced at relatively constant rates
+    regardless of project maturity or scale.
+\end{enumerate}
+
+\subsection{Implications for Developers}
+
+Our findings reinforce the importance of integrating SAST tools into
+continuous integration pipelines. The presence of high-severity
+findings in popular, heavily starred repositories---combined with the
+weak positive correlation between popularity and finding
+density---suggests that community trust (measured by stars) is not a
+reliable proxy for security quality. We recommend that maintainers of
+Python networking libraries adopt at least one SAST tool, enable
+confidence-based filtering to suppress noise, and triage high-severity
+findings as part of their release process.
+
+\subsection{Validating the Multi-Tool Approach}
+
+Our use of both Bandit and Semgrep directly addresses a gap identified
+by prior literature. Alfadel et al.~\cite{Alfadel2023} concluded that
+current security tools used by maintainers ``are not qualified to find
+more complex and critical issues'' and called for robust tools that
+combine multiple analysis techniques. By employing two SAST tools with
+distinct rule profiles, our methodology provides broader detection
+coverage than single-tool studies such as Ruohonen et
+al.~\cite{Ruohonen2021}, pending the per-repository overlap analysis
+that would quantify the marginal coverage each tool contributes.
+Furthermore, while Alfadel et al.'s analysis relied on mining existing
+vulnerability reports from third-party databases (Snyk.io), our
+approach actively scans source code, enabling detection of potential
+vulnerabilities that have not yet been reported or assigned CVE
+identifiers.
+
+\subsection{Ecosystem-Level Implications}
+
+Alfadel et al.~\cite{Alfadel2023} recommended that the Python
+ecosystem implement automated code vetting processes before packages
+are published to PyPI. The \textsc{NetVulnPy} pipeline demonstrates
+that such automated scanning is technically feasible at scale: our
+pipeline processes thousands of repositories with configurable
+parallelism and produces structured, queryable results. A similar
+approach could be integrated into package registries or CI/CD
+workflows to provide baseline security screening before code reaches
+production.
+
+\subsection{Threats to Validity}
+
+\textbf{Internal validity.} SAST tools produce both false positives
+and false negatives. To quantify false-positive rates, we validated a
+stratified sample of 100~findings per tool using an independent LLM
+verifier (Section~\ref{sec:results}). The estimated precision ranges
+from 9.0\% (LLM) to 21.0\% (Semgrep), confirming that all reported
+counts should be interpreted as \emph{potential} vulnerabilities.
+However, our validation itself uses an LLM as the verifier rather than
+human expert review, which introduces two potential biases: (1)~the
+LLM verifier may share systematic blind spots with the LLM analyzer
+(self-evaluation bias), potentially inflating or deflating precision
+estimates for LLM findings; and (2)~the verifier may apply different
+severity thresholds than a human security auditor. While we mitigated
+bias~(1) by using a single verification model across all three tools
+(ensuring consistent evaluation criteria), human validation of a
+subset would further strengthen these estimates.
+
+\textbf{External validity.} Our dataset is limited to repositories
+discoverable via the GitHub Search API with specific
+networking-related keywords. Keyword-based harvesting over-recovers web
+frameworks and general-purpose libraries that are not strictly
+networking tools, and we did not manually validate the domain
+membership of the sampled repositories; the ``networking''
+characterization should therefore be read as keyword-defined rather
+than manually curated. The sample also excludes private repositories
+and code hosted elsewhere, and sorting by stars introduces a
+popularity bias.
+%% TODO: consider manually coding a random sample of repositories to
+%% estimate what fraction are genuinely networking-domain projects, and
+%% report that domain-precision figure.
+
+\textbf{Construct validity.} The mapping of Semgrep severities
+(ERROR $\rightarrow$ HIGH, WARNING $\rightarrow$ MEDIUM,
+INFO $\rightarrow$ LOW) is a simplification; Semgrep's severity
+semantics differ from Bandit's, which limits the validity of direct
+cross-tool comparisons of severity proportions.
+
+
+%%═════════════════════════════════════════════════════════════════════
+\section{Conclusion and Future Work}
+\label{sec:conclusion}
+
+We presented \textsc{NetVulnPy}, an automated pipeline for
+large-scale vulnerability analysis of open-source Python networking
+repositories. By applying Bandit, Semgrep, and an LLM-based analyzer
+to 1{,}984 repositories, we identified 698{,}020 Bandit findings
+(91{,}723 excluding the dominant low-severity \texttt{assert\_used}
+rule), 5{,}614 Semgrep findings, and 82{,}741 LLM findings,
+demonstrating that the three tools offer distinct rule profiles and
+severity distributions. A precision validation on 100~stratified
+samples per tool reveals that Semgrep achieves the highest precision
+(21.0\%), followed by Bandit (10.0\%) and the LLM (9.0\%), with
+HIGH-severity precision reaching 47.1\% for Semgrep. The LLM-based
+analyzer contributes vulnerability categories requiring semantic
+reasoning (SSRF, path traversal, context-aware credential detection)
+but at the cost of taxonomic consistency and high false-positive rates.
+
+By contrasting our first-party source-code findings against the
+dependency-chain analysis of Alfadel et al.~\cite{Alfadel2023} and
+the PyPI-wide scan of Ruohonen et al.~\cite{Ruohonen2021}, we
+provide a more complete picture of the Python networking security
+landscape.
+
+Future work includes: (1)~recomputing vulnerability density with B101
+excluded and on high-severity findings only, and applying
+confidence-based filtering; (2)~complementing the LLM-based precision
+validation with human expert review on a subset to calibrate the
+automated verifier; (3)~a per-repository and per-file overlap analysis
+to quantify Bandit/Semgrep/LLM complementarity; (4)~evaluating
+additional LLM models and prompt strategies to improve taxonomic
+consistency and reduce hallucinated findings; (5)~longitudinal
+analysis tracking how vulnerability density evolves across repository
+versions; (6)~extending the pipeline to support additional programming
+languages.
+
+%%─── Acknowledgments ─────────────────────────────────────────────────
+\begin{acks}
+This research was conducted in University of Passau. I am especially grateful to TA Talaya Farasat for her technical expertise and guidance throughout the research.
+
+\end{acks}
+
+
+%%─── References ──────────────────────────────────────────────────────
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+%%─── Appendix ────────────────────────────────────────────────────────
+\appendix
+
+\section{Pipeline Usage}
+\label{app:usage}
+
+The \textsc{NetVulnPy} pipeline is invoked as follows:
+
+\begin{verbatim}
+# Full pipeline with Bandit (default)
+python main.py --max-repos 100 --verbose
+
+# Full pipeline with Semgrep
+python main.py --max-repos 100 --analyzer semgrep --verbose
+
+# Full pipeline with LLM analyzer
+python main.py --max-repos 100 --analyzer llm \
+  --llm-api-key <key> --verbose
+
+# Re-run analysis only (repos already downloaded)
+python main.py --skip-harvest --skip-download --verbose
+
+# Launch the interactive dashboard
+streamlit run dashboard/app.py
+\end{verbatim}
+
+
+% \section{Database Schema}
+% \label{app:schema}
+
+% \begin{verbatim}
+% CREATE TABLE repos (
+%   full_name TEXT PRIMARY KEY,
+%   stars INTEGER, forks INTEGER,
+%   language TEXT, license TEXT,
+%   created_at TEXT, updated_at TEXT,
+%   size_kb INTEGER, ...
+% );
+
+% CREATE TABLE findings (
+%   id INTEGER PRIMARY KEY AUTOINCREMENT,
+%   repo TEXT REFERENCES repos(full_name),
+%   filename TEXT, test_id TEXT,
+%   test_name TEXT, issue_severity TEXT,
+%   issue_confidence TEXT, issue_text TEXT,
+%   line_number INTEGER, code TEXT
+% );
+
+% CREATE TABLE scan_summary (
+%   full_name TEXT, py_files_found INTEGER,
+%   total_issues INTEGER,
+%   high INTEGER, medium INTEGER, low INTEGER,
+%   exit_code INTEGER, analyzer TEXT,
+%   status TEXT, loc INTEGER
+% );
+% \end{verbatim}
+
+\end{document}
